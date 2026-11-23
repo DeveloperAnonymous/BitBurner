@@ -1,0 +1,22 @@
+{
+    "compilerOptions": {
+        "allowJs": true,
+        "checkJs": true,
+        "noEmit": true,
+        "strict": true,
+        "target": "ESNext",
+        "module": "ESNext",
+        "moduleResolution": "bundler",
+        "skipLibCheck": true,
+        "isolatedModules": true,
+        "jsx": "react",
+        "paths": {
+            "@ns": ["./NetscriptDefinitions.d.ts"],
+            "@/*": ["./src/*"],
+            "*": ["./src/*"],
+            "/*": ["./src/*"]
+        }
+    },
+    "include": ["src/**/*"],
+    "files": ["./NetscriptDefinitions.d.ts", "./NetscriptGlobals.d.ts"]
+}
