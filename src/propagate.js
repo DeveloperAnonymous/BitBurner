@@ -1,3 +1,5 @@
+import { reportFailure } from "/lib/report.js";
+
 const HACK_SCRIPT = "/batch/hack.js";
 const GROW_SCRIPT = "/batch/grow.js";
 const WEAKEN_SCRIPT = "/batch/weaken.js";
@@ -8,14 +10,14 @@ const BATCH_SHRINK_FACTOR = 0.75;
 const GROW_SAFETY = 1.1;
 const SPACER_MS = 100;
 const BATCH_STRIDE_MS = 4 * SPACER_MS;
-const MAX_BATCHES_PER_WAVE = 250;
-const LANDING_BUFFER_MS = 500;
-const EXIT_POLL_MS = 200;
+const MAX_BATCHES_PER_WAVE = 1000;
+const LOOP_MS = 1000;
 const IDLE_WAIT_MS = 30000;
+const STATUS_EVERY_LOOPS = 30;
 const SECURITY_TOLERANCE = 0.05;
 const MONEY_TOLERANCE = 0.99;
-const TARGET_SWITCH_RATIO = 2.5;
 const MIN_MONEY_FOR_GROWTH = 1;
+const MAX_STOLEN_FRACTION = 0.9;
 
 // Fixed game values, hardcoded because the analyze functions that return them cost 1 GB each.
 const HACK_SECURITY_PER_THREAD = 0.002;
@@ -38,46 +40,78 @@ const CRACKERS = [
  * @typedef {{ hackThreads: number, hackWeakenThreads: number, growThreads: number, growWeakenThreads: number }} BatchThreads
  * @typedef {{ hackMs: number, growMs: number, weakenMs: number }} Timing
  * @typedef {{ hackRam: number, growRam: number, weakenRam: number }} ScriptRam
+ * @typedef {{ pids: number[], remaining: Map<string, number> }} Launch
  */
 
 /** @param {NS} ns */
 export async function main(ns) {
     ns.disableLog("ALL");
 
-    const scriptRam = readScriptRam(ns);
-    /** @type {string | null} */
-    let target = null;
+    let scriptRam = readScriptRam(ns);
+    while (scriptRam === null) {
+        await ns.sleep(IDLE_WAIT_MS);
+        scriptRam = readScriptRam(ns);
+    }
+
+    /** @type {Map<string, number[]>} */
+    const busyTargets = new Map();
+    let loop = 0;
 
     while (true) {
         const servers = scanNetwork(ns);
         rootAll(ns, servers);
-        const hosts = workerHosts(ns, servers);
-        copyBatchScripts(ns, hosts);
-        target = chooseTarget(ns, servers, target);
+        const hosts = copyBatchScripts(ns, workerHosts(ns, servers));
+        releaseFinishedTargets(ns, busyTargets);
 
-        if (target === null) {
-            ns.print("No rooted target with money yet. Waiting.");
-            await ns.sleep(IDLE_WAIT_MS);
-            continue;
+        let pool = freeRamByHost(ns, hosts);
+        const freeTargets = rankedTargets(ns, servers).filter(target => !busyTargets.has(target));
+        for (const target of freeTargets) {
+            const launch = isPrepped(ns, target) ? launchWave(ns, target, pool, scriptRam) : launchPrep(ns, target, pool, scriptRam);
+            if (launch === null) continue;
+
+            busyTargets.set(target, launch.pids);
+            pool = launch.remaining;
         }
 
-        if (isPrepped(ns, target)) {
-            await runWave(ns, target, hosts, scriptRam);
-        } else {
-            await prepTarget(ns, target, hosts, scriptRam);
-        }
+        if (++loop % STATUS_EVERY_LOOPS === 0) printStatus(ns, busyTargets, hosts, pool);
+
+        await ns.sleep(LOOP_MS);
     }
 }
 
 /**
  * @param {NS} ns
- * @returns {ScriptRam}
+ * @param {Map<string, number[]>} busyTargets
+ */
+function releaseFinishedTargets(ns, busyTargets) {
+    for (const [target, pids] of [...busyTargets]) {
+        if (!pids.some(pid => ns.isRunning(pid))) busyTargets.delete(target);
+    }
+}
+
+/**
+ * @param {NS} ns
+ * @param {Map<string, number[]>} busyTargets
+ * @param {string[]} hosts
+ * @param {Map<string, number>} pool
+ */
+function printStatus(ns, busyTargets, hosts, pool) {
+    const totalRam = hosts.reduce((total, host) => total + ns.getServerMaxRam(host), 0);
+    const freeRam = [...pool.values()].reduce((total, free) => total + free, 0);
+    ns.print(`Working ${busyTargets.size} targets (${[...busyTargets.keys()].join(", ")}) | RAM ${ns.format.ram(totalRam - freeRam)} of ${ns.format.ram(totalRam)} used`);
+}
+
+/**
+ * @param {NS} ns
+ * @returns {ScriptRam | null} null while batch scripts are missing on home
  */
 function readScriptRam(ns) {
     const ramByScript = new Map(BATCH_SCRIPTS.map(script => [script, ns.getScriptRam(script, "home")]));
     const missing = BATCH_SCRIPTS.filter(script => ramByScript.get(script) === 0);
     if (missing.length > 0) {
-        throw new Error(`Batch scripts missing on home: ${missing.join(", ")}. Run "Bitburner: Sync All Files".`);
+        reportFailure(ns, `Batch scripts missing on home: ${missing.join(", ")}. Sync them; retrying.`);
+
+        return null;
     }
 
     return {
@@ -119,7 +153,8 @@ function rootAll(ns, servers) {
         for (const [, crack] of ownedCrackers) crack(ns, server);
 
         if (!ns.nuke(server)) {
-            throw new Error(`nuke ${server} failed with ${ownedCrackers.length} port crackers owned`);
+            reportFailure(ns, `nuke ${server} failed with ${ownedCrackers.length} port crackers owned`);
+            continue;
         }
 
         ns.print(`Rooted ${server}`);
@@ -148,64 +183,32 @@ function workerHosts(ns, servers) {
 /**
  * @param {NS} ns
  * @param {string[]} hosts
+ * @returns {string[]} the hosts that received the batch scripts
  */
 function copyBatchScripts(ns, hosts) {
-    for (const host of hosts) {
-        if (!ns.scp(BATCH_SCRIPTS, host, "home")) {
-            throw new Error(`scp of batch scripts to ${host} failed`);
-        }
-    }
+    return hosts.filter(host => {
+        if (ns.scp(BATCH_SCRIPTS, host, "home")) return true;
+
+        reportFailure(ns, `scp of batch scripts to ${host} failed; skipping it this pass`);
+
+        return false;
+    });
 }
 
 /**
+ * Every hackable server with money, best money per second of weaken time first.
  * @param {NS} ns
  * @param {string[]} servers
- * @param {string | null} current
- * @returns {string | null}
+ * @returns {string[]}
  */
-function chooseTarget(ns, servers, current) {
-    const best = pickBestTarget(ns, servers);
-    if (best === null) return null;
-    if (current === null) return best.server;
-
-    const currentScore = scoreTarget(ns, current, ns.getHackingLevel());
-    if (currentScore === null) return best.server;
-
-    const isClearlyBetter = best.score > currentScore * TARGET_SWITCH_RATIO;
-
-    return isClearlyBetter ? best.server : current;
-}
-
-/**
- * @param {NS} ns
- * @param {string[]} servers
- * @returns {{ server: string, score: number } | null}
- */
-function pickBestTarget(ns, servers) {
+function rankedTargets(ns, servers) {
     const hackLevel = ns.getHackingLevel();
-    const comfortableLevel = Math.max(1, Math.floor(hackLevel / 2));
+    const scored = servers.map(server => ({ server, score: scoreTarget(ns, server, hackLevel) }));
 
-    return bestScoring(ns, servers, comfortableLevel) ?? bestScoring(ns, servers, hackLevel);
-}
-
-/**
- * @param {NS} ns
- * @param {string[]} servers
- * @param {number} maxRequiredLevel
- * @returns {{ server: string, score: number } | null}
- */
-function bestScoring(ns, servers, maxRequiredLevel) {
-    /** @type {{ server: string, score: number } | null} */
-    let best = null;
-
-    for (const server of servers) {
-        const score = scoreTarget(ns, server, maxRequiredLevel);
-        if (score === null || (best !== null && score <= best.score)) continue;
-
-        best = { server, score };
-    }
-
-    return best;
+    return scored
+        .filter(entry => entry.score !== null)
+        .sort((a, b) => Number(b.score) - Number(a.score))
+        .map(entry => entry.server);
 }
 
 /**
@@ -252,11 +255,15 @@ function isPrepped(ns, target) {
 /**
  * @param {NS} ns
  * @param {string} target
- * @param {string[]} hosts
+ * @param {Map<string, number>} freeRam
  * @param {ScriptRam} scriptRam
+ * @returns {Launch | null} null when nothing could start
  */
-async function runWave(ns, target, hosts, scriptRam) {
-    let pool = freeRamByHost(ns, hosts);
+function launchWave(ns, target, freeRam, scriptRam) {
+    const stolenPerThread = ns.hackAnalyze(target);
+    if (stolenPerThread <= 0 || stolenPerThread >= 1) return null;
+
+    let pool = freeRam;
     const capacity = threadCapacity(pool, Math.max(scriptRam.hackRam, scriptRam.growRam, scriptRam.weakenRam));
     const threads = batchThreadsThatFit(ns, target, capacity);
     const timing = readTiming(ns, target);
@@ -270,21 +277,16 @@ async function runWave(ns, target, hosts, scriptRam) {
         if (plan === null) break;
 
         pool = plan.remaining;
-        pids.push(...plan.placements.map(placement => launch(ns, placement, target, `${waveId}-${batchCount}`)));
+        pids.push(...launchAll(ns, plan.placements, target, `${waveId}-${batchCount}`));
         batchCount++;
     }
 
-    if (batchCount === 0) {
-        ns.print(`No room for one batch on ${target}: the smallest needs ${totalThreads(threads)} threads, ${capacity} free. Waiting.`);
-        await ns.sleep(IDLE_WAIT_MS);
-
-        return;
-    }
+    if (batchCount === 0) return null;
 
     const lastLandingMs = timing.weakenMs + 3 * SPACER_MS + (batchCount - 1) * BATCH_STRIDE_MS;
     ns.print(`Wave on ${target}: ${batchCount} batches, ${threads.hackThreads} hack threads each, lands in ${ns.format.time(lastLandingMs)}`);
-    await ns.sleep(lastLandingMs + LANDING_BUFFER_MS);
-    await waitForExit(ns, pids);
+
+    return { pids, remaining: pool };
 }
 
 /**
@@ -328,12 +330,7 @@ function batchThreadsThatFit(ns, target, capacity) {
  * @returns {number}
  */
 function stolenPerHackThread(ns, target) {
-    const stolenPerThread = ns.hackAnalyze(target);
-    if (stolenPerThread <= 0) {
-        throw new Error(`hackAnalyze(${target}) is ${stolenPerThread}: the target cannot be hacked at this level`);
-    }
-
-    return stolenPerThread;
+    return ns.hackAnalyze(target);
 }
 
 /**
@@ -343,11 +340,7 @@ function stolenPerHackThread(ns, target) {
  * @returns {BatchThreads}
  */
 function batchThreads(ns, target, hackThreads) {
-    const stolenFraction = stolenPerHackThread(ns, target) * hackThreads;
-    if (stolenFraction >= 1) {
-        throw new Error(`One hack thread steals all money on ${target}; pick a richer target`);
-    }
-
+    const stolenFraction = Math.min(stolenPerHackThread(ns, target) * hackThreads, MAX_STOLEN_FRACTION);
     const growThreads = Math.ceil(ns.growthAnalyze(target, 1 / (1 - stolenFraction)) * GROW_SAFETY);
 
     return {
@@ -393,11 +386,11 @@ function batchJobs(threads, timing, scriptRam, batchIndex) {
 /**
  * @param {NS} ns
  * @param {string} target
- * @param {string[]} hosts
+ * @param {Map<string, number>} pool
  * @param {ScriptRam} scriptRam
+ * @returns {Launch | null} null when nothing could start
  */
-async function prepTarget(ns, target, hosts, scriptRam) {
-    const pool = freeRamByHost(ns, hosts);
+function launchPrep(ns, target, pool, scriptRam) {
     const prepRam = Math.max(scriptRam.growRam, scriptRam.weakenRam);
     const capacity = [...pool.values()].reduce((total, free) => total + Math.floor(free / prepRam), 0);
     const timing = readTiming(ns, target);
@@ -405,22 +398,17 @@ async function prepTarget(ns, target, hosts, scriptRam) {
     const plan = placeJobs(pool, jobs);
 
     if (plan === null) {
-        throw new Error(`Prep jobs for ${target} did not fit in the ${capacity} threads counted as free`);
+        reportFailure(ns, `Prep jobs for ${target} did not fit in the ${capacity} threads counted as free; retrying`);
+
+        return null;
     }
 
-    if (plan.placements.length === 0) {
-        ns.print(`No free RAM to prep ${target}. Waiting.`);
-        await ns.sleep(IDLE_WAIT_MS);
+    if (plan.placements.length === 0) return null;
 
-        return;
-    }
+    const pids = launchAll(ns, plan.placements, target, `prep-${Date.now()}`);
+    ns.print(`Prepping ${target}, lands in ${ns.format.time(timing.weakenMs + 2 * SPACER_MS)}`);
 
-    const waveId = Date.now();
-    const pids = plan.placements.map((placement, index) => launch(ns, placement, target, `prep-${waveId}-${index}`));
-    const landingMs = timing.weakenMs + 2 * SPACER_MS;
-    ns.print(`Prepping ${target}, lands in ${ns.format.time(landingMs)}`);
-    await ns.sleep(landingMs + LANDING_BUFFER_MS);
-    await waitForExit(ns, pids);
+    return { pids, remaining: plan.remaining };
 }
 
 /**
@@ -505,26 +493,17 @@ function splitAcrossHosts(remaining, job) {
 
 /**
  * @param {NS} ns
- * @param {Placement} placement
+ * @param {Placement[]} placements
  * @param {string} target
  * @param {string} tag
- * @returns {number}
+ * @returns {number[]} pids of the jobs that started
  */
-function launch(ns, placement, target, tag) {
-    const pid = ns.exec(placement.script, placement.host, placement.threads, target, placement.delay, tag);
-    if (pid === 0) {
-        throw new Error(`exec ${placement.script} on ${placement.host} with ${placement.threads} threads failed`);
+function launchAll(ns, placements, target, tag) {
+    const pids = placements.map((placement, index) => ns.exec(placement.script, placement.host, placement.threads, target, placement.delay, `${tag}-${index}`));
+    const failed = placements.filter((_, index) => pids[index] === 0);
+    if (failed.length > 0) {
+        reportFailure(ns, `${failed.length} of ${placements.length} jobs did not start (first: ${failed[0].script} x${failed[0].threads} on ${failed[0].host})`);
     }
 
-    return pid;
-}
-
-/**
- * @param {NS} ns
- * @param {number[]} pids
- */
-async function waitForExit(ns, pids) {
-    while (pids.some(pid => ns.isRunning(pid))) {
-        await ns.sleep(EXIT_POLL_MS);
-    }
+    return pids.filter(pid => pid !== 0);
 }

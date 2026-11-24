@@ -1,3 +1,5 @@
+import { reportFailure } from "/lib/report.js";
+
 const MAX_PAYBACK_SECONDS = 24 * 60 * 60;
 const SPEND_FRACTION = 0.5;
 const BUY_WAIT_MS = 1000;
@@ -14,7 +16,9 @@ export async function main(ns) {
     ns.disableLog("ALL");
 
     if (ns.hacknet.hashCapacity() > 0) {
-        throw new Error("hacknet.js handles Hacknet Nodes only; this save has Hacknet Servers, which produce hashes");
+        reportFailure(ns, "hacknet.js handles Hacknet Nodes only; this save has Hacknet Servers, which produce hashes");
+
+        return;
     }
 
     while (true) {
@@ -31,7 +35,9 @@ export async function main(ns) {
         }
 
         if (!best.buy()) {
-            throw new Error(`Buying ${best.label} for $${ns.format.number(best.cost)} failed`);
+            reportFailure(ns, `Buying ${best.label} for $${ns.format.number(best.cost)} failed; retrying`);
+            await ns.sleep(BUY_WAIT_MS);
+            continue;
         }
 
         ns.print(`Bought ${best.label} for $${ns.format.number(best.cost)}, +$${ns.format.number(best.gain)}/s`);

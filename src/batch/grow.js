@@ -2,7 +2,9 @@
 export async function main(ns) {
     const [target, additionalMsec] = ns.args;
     if (typeof target !== "string" || typeof additionalMsec !== "number") {
-        throw new Error(`grow.js needs (target, delayMs, tag), got ${JSON.stringify(ns.args)}`);
+        ns.toast(`batch/grow.js needs (target, delayMs, tag), got ${JSON.stringify(ns.args)}`, "error", 15000);
+
+        return;
     }
 
     await ns.grow(target, { additionalMsec });

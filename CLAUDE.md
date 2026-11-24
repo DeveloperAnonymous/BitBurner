@@ -76,7 +76,8 @@ Consult before writing any ns call:
 
 ## Code rules
 
-- No silent fallbacks. Let errors throw. No default values for required data, no catch-and-continue, no "use X if missing".
+- Game scripts never throw: a crash pops a large runtime-error dialog and stops the automation (user decision, overrides the global "let it fail" rule for `src\`). Report every failure with `reportFailure(ns, message)` from `/lib/report.js` (log line plus toast), then skip that step and retry on the next loop. Batch workers copied to other servers use `ns.toast` inline instead of importing.
+- Still no silent fallbacks: never hide a failure or invent a default for required data. A failure must always be reported, just not thrown.
 - Log with `ns.print` (script log window) and `ns.tprint` (terminal). Call `ns.disableLog("ALL")` or specific functions to cut noise, and keep logs short and specific.
 - Blank line before `return` (except a guard `return` directly under its `if`, or a function whose whole body is a single `return`). Blank line above and below loops and multi-line `if` blocks, unless the iterated or tested value is defined on the line directly above.
 - Clear names, small functions, no comments that restate code.

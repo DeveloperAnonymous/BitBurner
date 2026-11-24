@@ -1,10 +1,13 @@
+import { reportFailure } from "/lib/report.js";
+
 const BUY_FORECAST = 0.55;
 const SELL_FORECAST = 0.5;
 const INVEST_FRACTION = 0.8;
-const CASH_FLOOR = 20e9;
+const CASH_FLOOR = 10e9;
 const REBALANCE_BAND = 0.25;
 const MIN_TRADE_COMMISSIONS = 1000;
 const SUMMARY_EVERY_TICKS = 10;
+const ACCESS_RECHECK_MS = 60000;
 
 /**
  * @typedef {{ sym: string, forecast: number, volatility: number, ask: number, bid: number, owned: number, avgPrice: number, maxShares: number }} Quote
@@ -15,7 +18,11 @@ const SUMMARY_EVERY_TICKS = 10;
 /** @param {NS} ns */
 export async function main(ns) {
     ns.disableLog("ALL");
-    requireMarketAccess(ns);
+
+    for (let missing = missingAccess(ns); missing.length > 0; missing = missingAccess(ns)) {
+        reportFailure(ns, `stock.js needs ${missing.join(", ")} (buy at the World Stock Exchange); checking again in a minute`);
+        await ns.sleep(ACCESS_RECHECK_MS);
+    }
 
     const commission = ns.stock.getConstants().StockMarketCommission;
     const fees = { commission, minTrade: commission * MIN_TRADE_COMMISSIONS };
@@ -36,14 +43,16 @@ export async function main(ns) {
     }
 }
 
-/** @param {NS} ns */
-function requireMarketAccess(ns) {
-    const missing = [
+/**
+ * @param {NS} ns
+ * @returns {string[]}
+ */
+function missingAccess(ns) {
+    return [
         [ns.stock.hasWseAccount(), "WSE account"],
         [ns.stock.hasTixApiAccess(), "TIX API"],
         [ns.stock.has4SDataTixApi(), "4S Market Data TIX API"],
-    ].filter(([owned]) => !owned).map(([, name]) => name);
-    if (missing.length > 0) throw new Error(`stock.js needs ${missing.join(", ")} (buy them at the World Stock Exchange)`);
+    ].filter(([owned]) => !owned).map(([, name]) => String(name));
 }
 
 /**
@@ -84,7 +93,7 @@ function expectedReturn(stock) {
 function allocationTargets(ns, quotes) {
     const picks = quotes.filter(stock => stock.forecast >= BUY_FORECAST).sort((a, b) => expectedReturn(b) - expectedReturn(a));
     const held = quotes.filter(stock => stock.owned > 0 && !picks.includes(stock));
-    const budget = stockBudget(ns, quotes) - value(held);
+    const budget = Math.max(0, stockBudget(ns, quotes) - value(held));
     const totalWeight = picks.reduce((total, stock) => total + expectedReturn(stock), 0);
 
     return picks.map(stock => ({ stock, targetValue: Math.min(budget * (expectedReturn(stock) / totalWeight), stock.maxShares * stock.ask) }));
@@ -138,7 +147,10 @@ function buyUnderweight(ns, quotes, targets, fees) {
         if (shares * stock.ask < fees.minTrade) continue;
 
         const price = ns.stock.buyStock(stock.sym, shares);
-        if (price === 0) throw new Error(`Buying ${shares} ${stock.sym} failed`);
+        if (price === 0) {
+            reportFailure(ns, `buying ${ns.format.number(shares, 0)} ${stock.sym} failed: cash is ${ns.format.number(ns.getServerMoneyAvailable("home"))}, another script likely spent it`);
+            continue;
+        }
 
         budget -= shares * price;
         stock.owned += shares;
@@ -156,7 +168,11 @@ function buyUnderweight(ns, quotes, targets, fees) {
  */
 function sell(ns, stock, shares, fees, reason) {
     const price = ns.stock.sellStock(stock.sym, shares);
-    if (price === 0) throw new Error(`Selling ${shares} ${stock.sym} failed`);
+    if (price === 0) {
+        reportFailure(ns, `selling ${ns.format.number(shares, 0)} ${stock.sym} failed (${reason}); retrying next tick`);
+
+        return 0;
+    }
 
     const gain = (price - stock.avgPrice) * shares - 2 * fees.commission;
     ns.print(`SOLD ${ns.format.number(shares, 0)} ${stock.sym} @ ${ns.format.number(price)} (${reason}, P/L ${ns.format.number(gain)})`);
@@ -173,7 +189,7 @@ function sell(ns, stock, shares, fees, reason) {
 function stockBudget(ns, quotes) {
     const netWorth = ns.getServerMoneyAvailable("home") + value(quotes);
 
-    return Math.min(netWorth * INVEST_FRACTION, netWorth - CASH_FLOOR);
+    return Math.max(0, Math.min(netWorth * INVEST_FRACTION, netWorth - CASH_FLOOR));
 }
 
 /** @param {Quote[]} quotes */

@@ -1,3 +1,5 @@
+import { reportFailure } from "/lib/report.js";
+
 const SPEND_FRACTION = 0.5;
 const MIN_RAM = 8;
 const NAME_PREFIX = "cloud-";
@@ -20,7 +22,9 @@ export async function main(ns) {
         }
 
         if (!purchase.buy()) {
-            throw new Error(`${purchase.label} at ${ns.format.ram(purchase.ram)} for $${ns.format.number(purchase.cost)} failed`);
+            reportFailure(ns, `${purchase.label} at ${ns.format.ram(purchase.ram)} for $${ns.format.number(purchase.cost)} failed; retrying`);
+            await ns.sleep(WAIT_MS);
+            continue;
         }
 
         ns.print(`${purchase.label} at ${ns.format.ram(purchase.ram)} for $${ns.format.number(purchase.cost)}`);
