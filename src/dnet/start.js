@@ -1,4 +1,4 @@
-import { CRAWLER_FILE as CRAWLER, CRAWLER_FILES as FILES, CRAWLER_VERSION, REPORT_PORT } from "/dnet/shared.js";
+import { CRAWLER_FILE as CRAWLER, CRAWLER_FILES as FILES, CRAWLER_VERSION, PHISH_FILE as PHISH, REPORT_PORT, VERSION_PORT } from "/dnet/shared.js";
 import { reportFailure } from "/lib/report.js";
 
 const ENTRY = "darkweb";
@@ -9,6 +9,7 @@ const MONEY_SUFFIXES = { "": 1, k: 1e3, m: 1e6, b: 1e9, t: 1e12, q: 1e15 };
 /** @param {NS} ns */
 export async function main(ns) {
     ns.disableLog("ALL");
+    announceVersion(ns);
     if (!launchCrawler(ns)) return;
 
     /** @type {Record<import("/dnet/shared.js").ReportKind, number>} */
@@ -44,6 +45,17 @@ function incomeTitle(ns, money, startedAt) {
 }
 
 /**
+ * Crawlers anywhere in the darknet watch this port and shut down with their phish script when the version differs,
+ * so the new crawler can take their node.
+ * @param {NS} ns
+ */
+function announceVersion(ns) {
+    ns.clearPort(VERSION_PORT);
+    ns.writePort(VERSION_PORT, CRAWLER_VERSION);
+    ns.print(`Announced crawler v${CRAWLER_VERSION}; older crawlers will shut down`);
+}
+
+/**
  * @param {NS} ns
  * @returns {boolean} whether the crawler is running
  */
@@ -61,6 +73,7 @@ function launchCrawler(ns) {
     }
 
     ns.scriptKill(CRAWLER, ENTRY);
+    ns.scriptKill(PHISH, ENTRY);
     const pid = ns.exec(CRAWLER, ENTRY, 1, CRAWLER_VERSION);
     if (pid === 0) {
         reportFailure(ns, `Starting ${CRAWLER} on ${ENTRY} failed (free RAM ${ns.getServerMaxRam(ENTRY) - ns.getServerUsedRam(ENTRY)} GB)`);

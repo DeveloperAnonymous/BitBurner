@@ -13,7 +13,7 @@ const WAIT_MS = 15000;
 export async function main(ns) {
     ns.disableLog("ALL");
 
-    while (true) {
+    while (!isFullyUpgraded(ns)) {
         const purchase = nextPurchase(ns, ns.getServerMoneyAvailable("home") * SPEND_FRACTION);
         if (purchase === null) {
             ns.print(`Nothing affordable with half the cash. Next step: ${describeNextStep(ns)}`);
@@ -30,6 +30,19 @@ export async function main(ns) {
         ns.print(`${purchase.label} at ${ns.format.ram(purchase.ram)} for $${ns.format.number(purchase.cost)}`);
         await ns.sleep();
     }
+
+    ns.tprint(`buy-servers.js: all ${ns.cloud.getServerLimit()} cloud servers are at the ${ns.format.ram(ns.cloud.getRamLimit())} RAM limit; exiting`);
+}
+
+/**
+ * True when the server count is at the limit and even the smallest server cannot double.
+ * @param {NS} ns
+ */
+function isFullyUpgraded(ns) {
+    const names = ns.cloud.getServerNames();
+    if (names.length < ns.cloud.getServerLimit()) return false;
+
+    return ns.getServerMaxRam(smallestServer(ns, names)) * 2 > ns.cloud.getRamLimit();
 }
 
 /**
@@ -136,7 +149,6 @@ function describeNextStep(ns) {
 
     const host = smallestServer(ns, names);
     const ram = ns.getServerMaxRam(host) * 2;
-    if (ram > ns.cloud.getRamLimit()) return "all servers are at the RAM limit";
 
     return `${host} to ${ns.format.ram(ram)} for $${ns.format.number(ns.cloud.getServerUpgradeCost(host, ram))}`;
 }

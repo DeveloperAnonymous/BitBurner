@@ -1,4 +1,4 @@
-import { CRAWLER_FILE as CRAWLER, CRAWLER_FILES, CRAWLER_VERSION as VERSION, PHISH_FILE as PHISH, report } from "/dnet/shared.js";
+import { CRAWLER_FILE as CRAWLER, CRAWLER_FILES, CRAWLER_VERSION as VERSION, PHISH_FILE as PHISH, VERSION_PORT, report } from "/dnet/shared.js";
 import { crackPassword } from "/dnet/solvers.js";
 
 const LEGACY_WORM = "dnet/worm.js";
@@ -11,18 +11,33 @@ export async function main(ns) {
 
     const here = ns.getHostname();
     ns.scriptKill(LEGACY_WORM, here);
+    ns.scriptKill(PHISH, here);
 
-    while (true) {
+    while (!isOutdated(ns)) {
         await freeBlockedRam(ns, here);
         openCaches(ns, here);
 
         for (const host of ns.dnet.probe()) {
+            if (isOutdated(ns)) break;
+
             await spreadTo(ns, host);
         }
 
         startPhishing(ns, here);
         await ns.sleep(LOOP_MS);
     }
+
+    ns.scriptKill(PHISH, here);
+}
+
+/**
+ * True once dnet/start.js has announced a different crawler version. An empty port (game just loaded) is not a newer version.
+ * @param {NS} ns
+ */
+function isOutdated(ns) {
+    const announced = ns.peek(VERSION_PORT);
+
+    return typeof announced === "number" && announced !== VERSION;
 }
 
 /**
