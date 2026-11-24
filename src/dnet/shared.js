@@ -1,6 +1,8 @@
-export const CRAWLER_VERSION = 3;
+export const CRAWLER_VERSION = 5;
 export const REPORT_PORT = 7;
-export const SHARED_FILE = "dnet/shared.js";
+export const CRAWLER_FILE = "dnet/crawler.js";
+export const PHISH_FILE = "dnet/phish.js";
+export const CRAWLER_FILES = [CRAWLER_FILE, PHISH_FILE, "dnet/shared.js", "dnet/solvers.js"];
 
 /** @typedef {"cache" | "cracked" | "failed" | "phish"} ReportKind */
 

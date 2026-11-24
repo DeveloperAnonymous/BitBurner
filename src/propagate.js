@@ -268,9 +268,10 @@ function launchWave(ns, target, allotment, scriptRam) {
     if (stolenPerThread <= 0 || stolenPerThread >= 1) return null;
 
     let pool = allotment.pool;
-    const threads = batchThreadsForShare(ns, target, allotment.ramShare, scriptRam);
-    const batchLimit = Math.min(MAX_BATCHES_PER_WAVE, Math.floor(allotment.ramShare / batchRam(threads, scriptRam)));
     const timing = readTiming(ns, target);
+    const overlappingBatches = Math.max(1, Math.min(MAX_BATCHES_PER_WAVE, Math.floor(timing.weakenMs / BATCH_STRIDE_MS)));
+    const threads = largestBatchWithin(ns, target, allotment.ramShare / overlappingBatches, scriptRam);
+    const batchLimit = Math.min(overlappingBatches, Math.floor(allotment.ramShare / batchRam(threads, scriptRam)));
     const waveId = Date.now();
     /** @type {number[]} */
     const pids = [];
@@ -315,16 +316,14 @@ function batchRam(threads, scriptRam) {
 }
 
 /**
- * The biggest batch that still lets MAX_BATCHES_PER_WAVE batches fit in the RAM share, stealing at most MAX_STOLEN_FRACTION.
- * Small shares fall back to one hack thread with fewer batches.
+ * The biggest batch that fits in ramPerBatch, stealing at most MAX_STOLEN_FRACTION. Falls back to one hack thread.
  * @param {NS} ns
  * @param {string} target
- * @param {number} ramShare
+ * @param {number} ramPerBatch
  * @param {ScriptRam} scriptRam
  * @returns {BatchThreads}
  */
-function batchThreadsForShare(ns, target, ramShare, scriptRam) {
-    const ramPerBatch = ramShare / MAX_BATCHES_PER_WAVE;
+function largestBatchWithin(ns, target, ramPerBatch, scriptRam) {
     let fits = 1;
     let tooBig = Math.floor(MAX_STOLEN_FRACTION / stolenPerHackThread(ns, target)) + 1;
 

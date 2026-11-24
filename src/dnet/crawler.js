@@ -1,17 +1,9 @@
-import { CRAWLER_VERSION as VERSION, SHARED_FILE, report } from "/dnet/shared.js";
+import { CRAWLER_FILE as CRAWLER, CRAWLER_FILES, CRAWLER_VERSION as VERSION, PHISH_FILE as PHISH, report } from "/dnet/shared.js";
+import { crackPassword } from "/dnet/solvers.js";
 
-const CRAWLER = "dnet/crawler.js";
 const LEGACY_WORM = "dnet/worm.js";
-const PHISH = "dnet/phish.js";
 const LOOP_MS = 5000;
 const reportedFailures = new Set();
-
-/** @type {Record<string, (details: { data: string, passwordHint: string, passwordLength: number }) => string[]>} */
-const PASSWORD_GUESSES = {
-    "ZeroLogon": () => [""],
-    "CloudBlare(tm)": ({ data }) => [data.replace(/\D/g, "")],
-    "PHP 5.4": ({ data }) => [...new Set(permutations(data.split("")).map(digits => digits.join("")))],
-};
 
 /** @param {NS} ns */
 export async function main(ns) {
@@ -21,6 +13,7 @@ export async function main(ns) {
     ns.scriptKill(LEGACY_WORM, here);
 
     while (true) {
+        await freeBlockedRam(ns, here);
         openCaches(ns, here);
 
         for (const host of ns.dnet.probe()) {
@@ -29,6 +22,25 @@ export async function main(ns) {
 
         startPhishing(ns, here);
         await ns.sleep(LOOP_MS);
+    }
+}
+
+/**
+ * Frees RAM the server owner blocks, until none is left or a call frees nothing.
+ * @param {NS} ns
+ * @param {string} host
+ */
+async function freeBlockedRam(ns, host) {
+    for (let blocked = ns.dnet.getBlockedRam(host); blocked > 0; ) {
+        const result = await ns.dnet.memoryReallocation(host);
+        const stillBlocked = ns.dnet.getBlockedRam(host);
+        if (!result.success || stillBlocked >= blocked) {
+            reportOnce(ns, `realloc:${host}`, `${host}: freeing ${blocked} GB blocked RAM stalled (${result.code} ${result.message})`);
+
+            return;
+        }
+
+        blocked = stillBlocked;
     }
 }
 
@@ -44,19 +56,45 @@ function openCaches(ns, here) {
 }
 
 /**
+ * Hosts the player unlocked by hand show root access, so they are deployed to without cracking.
  * @param {NS} ns
  * @param {string} host
  */
 async function spreadTo(ns, host) {
     const details = ns.dnet.getServerDetails(host);
     if (!details.isOnline || !details.isConnectedToCurrentServer) return;
-    if (!details.hasSession && !(await crack(ns, host, details))) return;
+
+    const unlockedByHand = !details.hasSession && ns.hasRootAccess(host);
+    if (!details.hasSession && !unlockedByHand && !(await crack(ns, host, details))) return;
+
     ns.scriptKill(LEGACY_WORM, host);
     if (ns.isRunning(CRAWLER, host, VERSION)) return;
 
+    await freeBlockedRam(ns, host);
+    deployCrawler(ns, host, unlockedByHand);
+}
+
+/**
+ * @param {NS} ns
+ * @param {string} host
+ * @param {boolean} unlockedByHand
+ */
+function deployCrawler(ns, host, unlockedByHand) {
+    const access = unlockedByHand ? "unlocked by hand, no script session" : "script session";
     ns.scriptKill(CRAWLER, host);
-    ns.scp([CRAWLER, PHISH, SHARED_FILE], host);
-    ns.exec(CRAWLER, host, 1, VERSION);
+    if (!ns.scp(CRAWLER_FILES, host)) {
+        reportOnce(ns, `scp:${host}`, `${host}: copying crawler files failed (${access})`);
+
+        return;
+    }
+
+    if (ns.exec(CRAWLER, host, 1, VERSION) === 0) {
+        reportOnce(ns, `exec:${host}`, `${host}: starting crawler failed (${access}, free RAM ${ns.getServerMaxRam(host) - ns.getServerUsedRam(host)} GB)`);
+
+        return;
+    }
+
+    if (unlockedByHand) report(ns, "cracked", `${host}: deployed to hand-unlocked node`);
 }
 
 /**
@@ -73,37 +111,30 @@ function startPhishing(ns, here) {
 /**
  * @param {NS} ns
  * @param {string} host
- * @param {any} details
+ * @param {ReturnType<NS["dnet"]["getServerDetails"]>} details
  */
 async function crack(ns, host, details) {
-    const guess = PASSWORD_GUESSES[details.modelId];
-    if (guess === undefined) return false;
-    if (ns.getPlayer().skills.charisma < details.requiredCharismaSkill) return false;
-
-    for (const password of guess(details)) {
-        const result = await ns.dnet.authenticate(host, password);
-        if (!result.success) continue;
-
-        report(ns, "cracked", `${host} (${details.modelId}) password "${password}"`);
+    const outcome = await crackPassword(ns, host, details);
+    if ("password" in outcome) {
+        report(ns, "cracked", `${host} (${details.modelId}) password "${outcome.password}"`);
 
         return true;
     }
 
-    if (!reportedFailures.has(host)) {
-        reportedFailures.add(host);
-        report(ns, "failed", `${host} (${details.modelId}) hint "${details.passwordHint}" data "${details.data}"`);
-    }
+    const describe = `${host} (${details.modelId}) hint "${details.passwordHint}" data "${details.data}" length ${details.passwordLength} ${details.passwordFormat}`;
+    reportOnce(ns, `crack:${host}`, `${describe}: ${outcome.failure}`);
 
     return false;
 }
 
 /**
- * @template T
- * @param {T[]} items
- * @returns {T[][]}
+ * @param {NS} ns
+ * @param {string} key
+ * @param {string} text
  */
-function permutations(items) {
-    if (items.length <= 1) return [items];
+function reportOnce(ns, key, text) {
+    if (reportedFailures.has(key)) return;
 
-    return items.flatMap((item, index) => permutations([...items.slice(0, index), ...items.slice(index + 1)]).map(rest => [item, ...rest]));
+    reportedFailures.add(key);
+    report(ns, "failed", text);
 }

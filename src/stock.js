@@ -2,7 +2,8 @@ import { reportFailure } from "/lib/report.js";
 
 const BUY_FORECAST = 0.55;
 const SELL_FORECAST = 0.5;
-const INVEST_FRACTION = 0.8;
+const INVEST_FRACTION = 0.95;
+const CONCENTRATION_POWER = 2;
 const CASH_FLOOR = 10e9;
 const REBALANCE_BAND = 0.25;
 const MIN_TRADE_COMMISSIONS = 1000;
@@ -84,8 +85,17 @@ function expectedReturn(stock) {
 }
 
 /**
- * Splits the stock budget over every stock at or above BUY_FORECAST in proportion to its expected return, so a stronger
- * forecast gets more money. Holdings between SELL_FORECAST and BUY_FORECAST keep their current value.
+ * Raising the expected return to CONCENTRATION_POWER moves money from marginal picks to the strongest ones.
+ * @param {Quote} stock
+ */
+function allocationWeight(stock) {
+    return expectedReturn(stock) ** CONCENTRATION_POWER;
+}
+
+/**
+ * Splits the stock budget over every stock at or above BUY_FORECAST in proportion to its allocation weight, so a stronger
+ * forecast gets more money. A stock whose share falls past its share limit is capped there and the rest of the budget is
+ * split again over the others. Holdings between SELL_FORECAST and BUY_FORECAST keep their current value.
  * @param {NS} ns
  * @param {Quote[]} quotes
  * @returns {Target[]}
@@ -93,10 +103,34 @@ function expectedReturn(stock) {
 function allocationTargets(ns, quotes) {
     const picks = quotes.filter(stock => stock.forecast >= BUY_FORECAST).sort((a, b) => expectedReturn(b) - expectedReturn(a));
     const held = quotes.filter(stock => stock.owned > 0 && !picks.includes(stock));
-    const budget = Math.max(0, stockBudget(ns, quotes) - value(held));
-    const totalWeight = picks.reduce((total, stock) => total + expectedReturn(stock), 0);
+    let budget = Math.max(0, stockBudget(ns, quotes) - value(held));
+    /** @type {Map<Quote, number>} */
+    const targetValues = new Map();
+    let uncapped = picks;
 
-    return picks.map(stock => ({ stock, targetValue: Math.min(budget * (expectedReturn(stock) / totalWeight), stock.maxShares * stock.ask) }));
+    while (uncapped.length > 0) {
+        const totalWeight = uncapped.reduce((total, stock) => total + allocationWeight(stock), 0);
+        const share = (/** @type {Quote} */ stock) => budget * (allocationWeight(stock) / totalWeight);
+        const capped = uncapped.filter(stock => share(stock) >= maxPositionValue(stock));
+        if (capped.length === 0) {
+            for (const stock of uncapped) targetValues.set(stock, share(stock));
+            break;
+        }
+
+        for (const stock of capped) {
+            targetValues.set(stock, maxPositionValue(stock));
+            budget -= maxPositionValue(stock);
+        }
+
+        uncapped = uncapped.filter(stock => !capped.includes(stock));
+    }
+
+    return picks.map(stock => ({ stock, targetValue: Number(targetValues.get(stock)) }));
+}
+
+/** @param {Quote} stock */
+function maxPositionValue(stock) {
+    return stock.maxShares * stock.ask;
 }
 
 /**

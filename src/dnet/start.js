@@ -1,9 +1,7 @@
-import { CRAWLER_VERSION, REPORT_PORT, SHARED_FILE } from "/dnet/shared.js";
+import { CRAWLER_FILE as CRAWLER, CRAWLER_FILES as FILES, CRAWLER_VERSION, REPORT_PORT } from "/dnet/shared.js";
 import { reportFailure } from "/lib/report.js";
 
 const ENTRY = "darkweb";
-const CRAWLER = "dnet/crawler.js";
-const FILES = [CRAWLER, "dnet/phish.js", SHARED_FILE];
 const EMPTY_PORT = "NULL PORT DATA";
 /** @type {Record<string, number>} */
 const MONEY_SUFFIXES = { "": 1, k: 1e3, m: 1e6, b: 1e9, t: 1e12, q: 1e15 };
