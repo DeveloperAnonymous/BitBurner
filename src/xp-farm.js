@@ -1,0 +1,9 @@
+/** @param {NS} ns */
+export async function main(ns) {
+    const [target] = ns.args;
+    if (typeof target !== "string") throw new Error(`xp-farm.js needs (target), got ${JSON.stringify(ns.args)}`);
+
+    while (true) {
+        await ns.weaken(target);
+    }
+}

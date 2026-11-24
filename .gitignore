@@ -1,0 +1,5 @@
+.vscode/settings.json
+NetscriptDefinitions.d.ts
+NetscriptGlobals.d.ts
+mcp/
+.mcp.json
