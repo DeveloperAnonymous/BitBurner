@@ -5,8 +5,6 @@ const GROW_SCRIPT = "/batch/grow.js";
 const WEAKEN_SCRIPT = "/batch/weaken.js";
 const BATCH_SCRIPTS = [HACK_SCRIPT, GROW_SCRIPT, WEAKEN_SCRIPT];
 
-const HACK_FRACTION = 0.1;
-const BATCH_SHRINK_FACTOR = 0.75;
 const GROW_SAFETY = 1.1;
 const SPACER_MS = 100;
 const BATCH_STRIDE_MS = 4 * SPACER_MS;
@@ -41,6 +39,7 @@ const CRACKERS = [
  * @typedef {{ hackMs: number, growMs: number, weakenMs: number }} Timing
  * @typedef {{ hackRam: number, growRam: number, weakenRam: number }} ScriptRam
  * @typedef {{ pids: number[], remaining: Map<string, number> }} Launch
+ * @typedef {{ pool: Map<string, number>, ramShare: number }} Allotment
  */
 
 /** @param {NS} ns */
@@ -65,8 +64,9 @@ export async function main(ns) {
 
         let pool = freeRamByHost(ns, hosts);
         const freeTargets = rankedTargets(ns, servers).filter(target => !busyTargets.has(target));
-        for (const target of freeTargets) {
-            const launch = isPrepped(ns, target) ? launchWave(ns, target, pool, scriptRam) : launchPrep(ns, target, pool, scriptRam);
+        for (const [index, target] of freeTargets.entries()) {
+            const allotment = { pool, ramShare: totalFreeRam(pool) / (freeTargets.length - index) };
+            const launch = isPrepped(ns, target) ? launchWave(ns, target, allotment, scriptRam) : launchPrep(ns, target, allotment, scriptRam);
             if (launch === null) continue;
 
             busyTargets.set(target, launch.pids);
@@ -97,8 +97,12 @@ function releaseFinishedTargets(ns, busyTargets) {
  */
 function printStatus(ns, busyTargets, hosts, pool) {
     const totalRam = hosts.reduce((total, host) => total + ns.getServerMaxRam(host), 0);
-    const freeRam = [...pool.values()].reduce((total, free) => total + free, 0);
-    ns.print(`Working ${busyTargets.size} targets (${[...busyTargets.keys()].join(", ")}) | RAM ${ns.format.ram(totalRam - freeRam)} of ${ns.format.ram(totalRam)} used`);
+    ns.print(`Working ${busyTargets.size} targets (${[...busyTargets.keys()].join(", ")}) | RAM ${ns.format.ram(totalRam - totalFreeRam(pool))} of ${ns.format.ram(totalRam)} used`);
+}
+
+/** @param {Map<string, number>} pool */
+function totalFreeRam(pool) {
+    return [...pool.values()].reduce((total, free) => total + free, 0);
 }
 
 /**
@@ -255,24 +259,24 @@ function isPrepped(ns, target) {
 /**
  * @param {NS} ns
  * @param {string} target
- * @param {Map<string, number>} freeRam
+ * @param {Allotment} allotment
  * @param {ScriptRam} scriptRam
  * @returns {Launch | null} null when nothing could start
  */
-function launchWave(ns, target, freeRam, scriptRam) {
-    const stolenPerThread = ns.hackAnalyze(target);
+function launchWave(ns, target, allotment, scriptRam) {
+    const stolenPerThread = stolenPerHackThread(ns, target);
     if (stolenPerThread <= 0 || stolenPerThread >= 1) return null;
 
-    let pool = freeRam;
-    const capacity = threadCapacity(pool, Math.max(scriptRam.hackRam, scriptRam.growRam, scriptRam.weakenRam));
-    const threads = batchThreadsThatFit(ns, target, capacity);
+    let pool = allotment.pool;
+    const threads = batchThreadsForShare(ns, target, allotment.ramShare, scriptRam);
+    const batchLimit = Math.min(MAX_BATCHES_PER_WAVE, Math.floor(allotment.ramShare / batchRam(threads, scriptRam)));
     const timing = readTiming(ns, target);
     const waveId = Date.now();
     /** @type {number[]} */
     const pids = [];
     let batchCount = 0;
 
-    while (batchCount < MAX_BATCHES_PER_WAVE) {
+    while (batchCount < batchLimit) {
         const plan = placeJobs(pool, batchJobs(threads, timing, scriptRam, batchCount));
         if (plan === null) break;
 
@@ -284,7 +288,8 @@ function launchWave(ns, target, freeRam, scriptRam) {
     if (batchCount === 0) return null;
 
     const lastLandingMs = timing.weakenMs + 3 * SPACER_MS + (batchCount - 1) * BATCH_STRIDE_MS;
-    ns.print(`Wave on ${target}: ${batchCount} batches, ${threads.hackThreads} hack threads each, lands in ${ns.format.time(lastLandingMs)}`);
+    const stolenPercent = Math.min(stolenPerThread * threads.hackThreads, MAX_STOLEN_FRACTION) * 100;
+    ns.print(`Wave on ${target}: ${batchCount} batches stealing ${stolenPercent.toFixed(1)}% each (${threads.hackThreads} hack threads), lands in ${ns.format.time(lastLandingMs)}`);
 
     return { pids, remaining: pool };
 }
@@ -300,28 +305,36 @@ function threadCapacity(pool, ramPerThread) {
 
 /**
  * @param {BatchThreads} threads
+ * @param {ScriptRam} scriptRam
  * @returns {number}
  */
-function totalThreads(threads) {
-    return threads.hackThreads + threads.hackWeakenThreads + threads.growThreads + threads.growWeakenThreads;
+function batchRam(threads, scriptRam) {
+    const weakenThreads = threads.hackWeakenThreads + threads.growWeakenThreads;
+
+    return threads.hackThreads * scriptRam.hackRam + threads.growThreads * scriptRam.growRam + weakenThreads * scriptRam.weakenRam;
 }
 
 /**
+ * The biggest batch that still lets MAX_BATCHES_PER_WAVE batches fit in the RAM share, stealing at most MAX_STOLEN_FRACTION.
+ * Small shares fall back to one hack thread with fewer batches.
  * @param {NS} ns
  * @param {string} target
- * @param {number} capacity
+ * @param {number} ramShare
+ * @param {ScriptRam} scriptRam
  * @returns {BatchThreads}
  */
-function batchThreadsThatFit(ns, target, capacity) {
-    let hackThreads = Math.max(1, Math.floor(HACK_FRACTION / stolenPerHackThread(ns, target)));
-    let threads = batchThreads(ns, target, hackThreads);
+function batchThreadsForShare(ns, target, ramShare, scriptRam) {
+    const ramPerBatch = ramShare / MAX_BATCHES_PER_WAVE;
+    let fits = 1;
+    let tooBig = Math.floor(MAX_STOLEN_FRACTION / stolenPerHackThread(ns, target)) + 1;
 
-    while (hackThreads > 1 && totalThreads(threads) > capacity) {
-        hackThreads = Math.floor(hackThreads * BATCH_SHRINK_FACTOR);
-        threads = batchThreads(ns, target, hackThreads);
+    while (tooBig - fits > 1) {
+        const middle = Math.floor((fits + tooBig) / 2);
+        if (batchRam(batchThreads(ns, target, middle), scriptRam) <= ramPerBatch) fits = middle;
+        else tooBig = middle;
     }
 
-    return threads;
+    return batchThreads(ns, target, fits);
 }
 
 /**
@@ -386,16 +399,16 @@ function batchJobs(threads, timing, scriptRam, batchIndex) {
 /**
  * @param {NS} ns
  * @param {string} target
- * @param {Map<string, number>} pool
+ * @param {Allotment} allotment
  * @param {ScriptRam} scriptRam
  * @returns {Launch | null} null when nothing could start
  */
-function launchPrep(ns, target, pool, scriptRam) {
+function launchPrep(ns, target, allotment, scriptRam) {
     const prepRam = Math.max(scriptRam.growRam, scriptRam.weakenRam);
-    const capacity = [...pool.values()].reduce((total, free) => total + Math.floor(free / prepRam), 0);
+    const capacity = Math.min(threadCapacity(allotment.pool, prepRam), Math.floor(allotment.ramShare / prepRam));
     const timing = readTiming(ns, target);
     const jobs = prepJobs(ns, target, capacity, timing, prepRam);
-    const plan = placeJobs(pool, jobs);
+    const plan = placeJobs(allotment.pool, jobs);
 
     if (plan === null) {
         reportFailure(ns, `Prep jobs for ${target} did not fit in the ${capacity} threads counted as free; retrying`);
