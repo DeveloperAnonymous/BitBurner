@@ -1,300 +1,200 @@
+const BUY_FORECAST = 0.6;
+const SELL_FORECAST = 0.5;
+const INVEST_FRACTION = 0.8;
+const CASH_FLOOR = 20e9;
+const TOP_PICKS = 6;
+const REBALANCE_BAND = 0.25;
+const MIN_TRADE_COMMISSIONS = 1000;
+const SUMMARY_EVERY_TICKS = 10;
+
+/**
+ * @typedef {{ sym: string, forecast: number, volatility: number, ask: number, bid: number, owned: number, avgPrice: number, maxShares: number }} Quote
+ * @typedef {{ commission: number, minTrade: number }} Fees
+ * @typedef {{ stock: Quote, targetValue: number }} Target
+ */
+
 /** @param {NS} ns */
 export async function main(ns) {
     ns.disableLog("ALL");
+    requireMarketAccess(ns);
 
-    const commission = 100000; // $100k per buy/sell transaction
-    const profitKeepRatio = 0.5; // Keep 50% of cash/gains in your account
-    const budgetFile = "stock-budget.txt";
-
-    // 4S thresholds (used once 4S Market Data TIX API is owned)
-    const buyThreshold4S = 0.62;
-    const sellThreshold4S = 0.50;
-    const minTradeValue4S = commission * 50; // $5m minimum trade size with 4S
-
-    // Pre-4S thresholds (longer window + concentrated positions to beat spread & fees)
-    const buyThresholdFallback = 0.72;
-    const sellThresholdFallback = 0.28;
-    const minTradeValueFallback = commission * 250; // $25m minimum trade size pre-4S
-    const maxPositionsPre4S = 2; // Concentrate capital into top 2 trends before 4S
-    const minHoldTicksPre4S = 6; // Hold at least ~36s before reacting to minor noise
-
-    const priceHistory = new Map();
-    const holdTicks = new Map();
-    const historyLength = 20;
-
-    let lastRecordedCash = ns.getServerMoneyAvailable("home");
-    let currentBudget = Math.max(0, lastRecordedCash * (1 - profitKeepRatio));
-    await writeBudget(ns, budgetFile, currentBudget);
-
-    ns.print(`📈 Starting v3.0.1 Stock Trader (Budget file: ${budgetFile})...`);
+    const commission = ns.stock.getConstants().StockMarketCommission;
+    const fees = { commission, minTrade: commission * MIN_TRADE_COMMISSIONS };
+    let realizedProfit = 0;
+    let tick = 0;
 
     while (true) {
-        const cash = ns.getServerMoneyAvailable("home");
+        const quotes = ns.stock.getSymbols().map(sym => quote(ns, sym));
+        realizedProfit += sellWeakPositions(ns, quotes, fees);
 
-        // Respect manual budget reductions in stock-budget.txt
-        const fileBudget = readBudget(ns, budgetFile);
-        if (fileBudget !== null && fileBudget < currentBudget) {
-            currentBudget = Math.max(0, fileBudget);
-        }
+        const targets = allocationTargets(ns, quotes);
+        realizedProfit += trimOverweight(ns, targets, fees);
+        buyUnderweight(ns, quotes, targets, fees);
 
-        // Allocate 50% of new cash inflows to budget; keep 50% free in account
-        if (cash > lastRecordedCash) {
-            const gain = cash - lastRecordedCash;
-            currentBudget += gain * (1 - profitKeepRatio);
-        }
+        if (++tick % SUMMARY_EVERY_TICKS === 0) printSummary(ns, realizedProfit);
 
-        currentBudget = Math.floor(Math.min(currentBudget, Math.max(0, cash * (1 - profitKeepRatio))));
-        await writeBudget(ns, budgetFile, currentBudget);
-        lastRecordedCash = cash;
-
-        // 1. Automatically buy WSE Account, TIX API, and 4S Market + TIX API when affordable
-        const spentOnApi = buyMarketAccess(ns, currentBudget);
-        if (spentOnApi > 0) {
-            currentBudget = Math.max(0, currentBudget - spentOnApi);
-            await writeBudget(ns, budgetFile, currentBudget);
-        }
-
-        const hasWse = safeBool(() => ns.stock.hasWseAccount());
-        const hasTix = safeBool(() => ns.stock.hasTixApiAccess());
-
-        if (hasWse && hasTix) {
-            const has4STix = safeBool(() => ns.stock.has4SDataTixApi());
-            const symbols = ns.stock.getSymbols();
-
-            for (const sym of symbols) {
-                // Track mid-price to avoid bid/ask distortion
-                const midPrice = (ns.stock.getAskPrice(sym) + ns.stock.getBidPrice(sym)) / 2;
-                if (!priceHistory.has(sym)) {
-                    priceHistory.set(sym, []);
-                }
-                const history = priceHistory.get(sym);
-                history.push(midPrice);
-                if (history.length > historyLength) {
-                    history.shift();
-                }
-            }
-
-            const sellThreshold = has4STix ? sellThreshold4S : sellThresholdFallback;
-            const buyThreshold = has4STix ? buyThreshold4S : buyThresholdFallback;
-            const minTradeValue = has4STix ? minTradeValue4S : minTradeValueFallback;
-
-            // 2. Sell positions once forecast or sustained momentum turns bearish
-            let openPositions = 0;
-            for (const sym of symbols) {
-                const pos = ns.stock.getPosition(sym);
-                const shares = pos[0] ?? 0;
-                const avgPrice = pos[1] ?? 0;
-
-                if (shares > 0) {
-                    const ticksHeld = (holdTicks.get(sym) ?? 0) + 1;
-                    holdTicks.set(sym, ticksHeld);
-
-                    const forecast = getEffectiveForecast(ns, sym, has4STix, priceHistory.get(sym));
-                    const canSellPre4S = ticksHeld >= minHoldTicksPre4S || forecast <= 0.15;
-
-                    if (forecast < sellThreshold && (has4STix || canSellPre4S)) {
-                        const soldPrice = ns.stock.sellStock(sym, shares);
-                        if (soldPrice > 0) {
-                            holdTicks.delete(sym);
-                            const netProfit = (soldPrice - avgPrice) * shares - commission * 2;
-                            if (netProfit > 0) {
-                                currentBudget += netProfit * (1 - profitKeepRatio);
-                            }
-
-                            const latestCash = ns.getServerMoneyAvailable("home");
-                            currentBudget = Math.floor(
-                                Math.min(currentBudget, Math.max(0, latestCash * (1 - profitKeepRatio)))
-                            );
-                            await writeBudget(ns, budgetFile, currentBudget);
-                            lastRecordedCash = latestCash;
-
-                            ns.print(
-                                `💰 SOLD ${shares} ${sym} @ ${ns.format.number(soldPrice)} ` +
-                                `(Net P/L: ${ns.format.number(netProfit)} | Budget: ${ns.format.number(currentBudget)})`
-                            );
-                            continue;
-                        }
-                    }
-
-                    openPositions++;
-                } else {
-                    holdTicks.delete(sym);
-                }
-            }
-
-            // 3. Rank strong buy candidates and open concentrated positions above minTradeValue
-            const candidates = [];
-            for (const sym of symbols) {
-                const history = priceHistory.get(sym);
-                if (!has4STix && (!history || history.length < historyLength)) {
-                    continue;
-                }
-
-                const forecast = getEffectiveForecast(ns, sym, has4STix, history);
-                if (forecast >= buyThreshold) {
-                    // Require recent 5-tick confirmation before 4S to avoid buying into a stalling top
-                    if (!has4STix && !hasRecentConfirmation(history, 5, 0.75)) {
-                        continue;
-                    }
-
-                    const maxShares = ns.stock.getMaxShares(sym);
-                    const pos = ns.stock.getPosition(sym);
-                    const currentShares = pos[0] ?? 0;
-                    const buyableShares = maxShares - currentShares;
-                    if (buyableShares > 0) {
-                        candidates.push({ sym, forecast, buyableShares, isExisting: currentShares > 0 });
-                    }
-                }
-            }
-
-            candidates.sort((a, b) => b.forecast - a.forecast);
-
-            for (const item of candidates) {
-                if (currentBudget < minTradeValue + commission) break;
-                if (!has4STix && !item.isExisting && openPositions >= maxPositionsPre4S) continue;
-
-                const askPrice = ns.stock.getAskPrice(item.sym);
-                const maxAffordable = Math.floor((currentBudget - commission) / askPrice);
-                const sharesToBuy = Math.min(item.buyableShares, maxAffordable);
-                const totalCost = sharesToBuy * askPrice + commission;
-
-                if (sharesToBuy > 0 && totalCost >= minTradeValue) {
-                    const boughtAt = ns.stock.buyStock(item.sym, sharesToBuy);
-                    if (boughtAt > 0) {
-                        if (!item.isExisting) {
-                            openPositions++;
-                            holdTicks.set(item.sym, 0);
-                        }
-                        const spent = boughtAt * sharesToBuy + commission;
-                        currentBudget = Math.max(0, currentBudget - spent);
-                        await writeBudget(ns, budgetFile, currentBudget);
-                        lastRecordedCash = ns.getServerMoneyAvailable("home");
-
-                        ns.print(
-                            `🛒 BOUGHT ${sharesToBuy} ${item.sym} @ ${ns.format.number(boughtAt)} ` +
-                            `(Signal: ${(item.forecast * 100).toFixed(1)}% | Budget left: ${ns.format.number(currentBudget)})`
-                        );
-                    }
-                }
-            }
-        } else {
-            ns.print(
-                `⏳ Waiting for WSE & TIX API access ` +
-                `(Cash: ${ns.format.number(cash)} | Budget in ${budgetFile}: ${ns.format.number(currentBudget)})...`
-            );
-        }
-
-        if (typeof ns.stock.nextUpdate === "function") {
-            await ns.stock.nextUpdate();
-        } else {
-            await ns.sleep(6000);
-        }
+        await ns.stock.nextUpdate();
     }
 }
 
-async function writeBudget(ns, file, amount) {
-    await ns.write(file, String(Math.max(0, Math.floor(amount))), "w");
+/** @param {NS} ns */
+function requireMarketAccess(ns) {
+    const missing = [
+        [ns.stock.hasWseAccount(), "WSE account"],
+        [ns.stock.hasTixApiAccess(), "TIX API"],
+        [ns.stock.has4SDataTixApi(), "4S Market Data TIX API"],
+    ].filter(([owned]) => !owned).map(([, name]) => name);
+    if (missing.length > 0) throw new Error(`stock.js needs ${missing.join(", ")} (buy them at the World Stock Exchange)`);
 }
 
-function readBudget(ns, file) {
-    if (!ns.fileExists(file, "home")) return null;
-    const raw = ns.read(file).trim();
-    if (!raw) return null;
-    const parsed = Number(raw);
-    return Number.isFinite(parsed) ? parsed : null;
+/**
+ * @param {NS} ns
+ * @param {string} sym
+ * @returns {Quote}
+ */
+function quote(ns, sym) {
+    const [owned, avgPrice] = ns.stock.getPosition(sym);
+
+    return {
+        sym,
+        forecast: ns.stock.getForecast(sym),
+        volatility: ns.stock.getVolatility(sym),
+        ask: ns.stock.getAskPrice(sym),
+        bid: ns.stock.getBidPrice(sym),
+        owned,
+        avgPrice,
+        maxShares: ns.stock.getMaxShares(sym),
+    };
 }
 
-function buyMarketAccess(ns, budget) {
-    if (budget <= 0) return 0;
-
-    const constants = safeCall(() => ns.stock.getConstants(), {});
-
-    const wseCost = constants.WseAccountCost ?? 200_000_000;
-    const tixCost = constants.TixApiCost ?? 5_000_000_000;
-    const fourSCost = constants.FourSigmaMarketDataCost ?? 1_000_000_000;
-    const fourSApiCost = constants.FourSigmaMarketDataApiCost ?? 25_000_000_000;
-
-    let spent = 0;
-
-    if (!safeBool(() => ns.stock.hasWseAccount())) {
-        if (budget >= wseCost && safeBool(() => ns.stock.purchaseWseAccount())) {
-            spent += wseCost;
-            ns.tprint(`✅ Purchased WSE Account (${ns.format.number(wseCost)})`);
-        }
-        return spent;
-    }
-
-    if (!safeBool(() => ns.stock.hasTixApiAccess())) {
-        if (budget >= tixCost && safeBool(() => ns.stock.purchaseTixApi())) {
-            spent += tixCost;
-            ns.tprint(`✅ Purchased TIX API Access (${ns.format.number(tixCost)})`);
-        }
-        return spent;
-    }
-
-    if (!safeBool(() => ns.stock.has4SData())) {
-        if (budget - spent >= fourSCost && safeBool(() => ns.stock.purchase4SMarketData())) {
-            spent += fourSCost;
-            ns.tprint(`✅ Purchased 4S Market Data (${ns.format.number(fourSCost)})`);
-        }
-    }
-
-    if (!safeBool(() => ns.stock.has4SDataTixApi())) {
-        if (budget - spent >= fourSApiCost && safeBool(() => ns.stock.purchase4SMarketDataTixApi())) {
-            spent += fourSApiCost;
-            ns.tprint(`✅ Purchased 4S Market Data TIX API (${ns.format.number(fourSApiCost)})`);
-        }
-    }
-
-    return spent;
+/**
+ * Average fractional price change per tick.
+ * @param {Quote} stock
+ */
+function expectedReturn(stock) {
+    return stock.volatility * (stock.forecast - 0.5);
 }
 
-function getEffectiveForecast(ns, sym, has4SApi, history) {
-    if (has4SApi) {
-        const forecast = safeCall(() => ns.stock.getForecast(sym), null);
-        if (typeof forecast === "number" && !Number.isNaN(forecast)) {
-            return forecast;
-        }
-    }
+/**
+ * Splits the stock budget over the strongest picks in proportion to their expected return, so a stronger forecast gets more money.
+ * Holdings outside the picks that are still above SELL_FORECAST keep their current value.
+ * @param {NS} ns
+ * @param {Quote[]} quotes
+ * @returns {Target[]}
+ */
+function allocationTargets(ns, quotes) {
+    const picks = quotes.filter(stock => stock.forecast >= BUY_FORECAST).sort((a, b) => expectedReturn(b) - expectedReturn(a)).slice(0, TOP_PICKS);
+    const held = quotes.filter(stock => stock.owned > 0 && !picks.includes(stock));
+    const budget = stockBudget(ns, quotes) - value(held);
+    const totalWeight = picks.reduce((total, stock) => total + expectedReturn(stock), 0);
 
-    if (!history || history.length < 2) {
-        return 0.5;
-    }
-
-    let upticks = 0;
-    let comparisons = 0;
-    for (let i = 1; i < history.length; i++) {
-        comparisons++;
-        if (history[i] > history[i - 1]) {
-            upticks++;
-        }
-    }
-
-    return comparisons > 0 ? upticks / comparisons : 0.5;
+    return picks.map(stock => ({ stock, targetValue: Math.min(budget * (expectedReturn(stock) / totalWeight), stock.maxShares * stock.ask) }));
 }
 
-function hasRecentConfirmation(history, windowTicks, minRatio) {
-    if (!history || history.length < windowTicks + 1) return false;
-    let upticks = 0;
-    const start = history.length - windowTicks;
-    for (let i = start; i < history.length; i++) {
-        if (history[i] > history[i - 1]) upticks++;
-    }
-    return upticks / windowTicks >= minRatio;
+/**
+ * @param {NS} ns
+ * @param {Quote[]} quotes
+ * @param {Fees} fees
+ * @returns {number} realized profit
+ */
+function sellWeakPositions(ns, quotes, fees) {
+    const weak = quotes.filter(stock => stock.owned > 0 && stock.forecast < SELL_FORECAST);
+
+    return weak.reduce((profit, stock) => profit + sell(ns, stock, stock.owned, fees, `forecast ${pct(stock.forecast)}`), 0);
 }
 
-function safeCall(fn, fallback) {
-    try {
-        return fn();
-    } catch {
-        return fallback;
+/**
+ * @param {NS} ns
+ * @param {Target[]} targets
+ * @param {Fees} fees
+ * @returns {number} realized profit
+ */
+function trimOverweight(ns, targets, fees) {
+    let profit = 0;
+
+    for (const { stock, targetValue } of targets) {
+        const excess = stock.owned * stock.bid - targetValue;
+        if (excess < Math.max(fees.minTrade, targetValue * REBALANCE_BAND)) continue;
+
+        profit += sell(ns, stock, Math.floor(excess / stock.bid), fees, `over target ${ns.format.number(targetValue)}`);
+    }
+
+    return profit;
+}
+
+/**
+ * @param {NS} ns
+ * @param {Quote[]} quotes
+ * @param {Target[]} targets
+ * @param {Fees} fees
+ */
+function buyUnderweight(ns, quotes, targets, fees) {
+    let budget = Math.min(ns.getServerMoneyAvailable("home") - CASH_FLOOR, stockBudget(ns, quotes) - value(quotes));
+
+    for (const { stock, targetValue } of targets) {
+        const shortfall = targetValue - stock.owned * stock.ask;
+        if (shortfall < Math.max(fees.minTrade, targetValue * REBALANCE_BAND)) continue;
+
+        const shares = Math.min(stock.maxShares - stock.owned, Math.floor(Math.min(shortfall, budget) / stock.ask));
+        if (shares * stock.ask < fees.minTrade) continue;
+
+        const price = ns.stock.buyStock(stock.sym, shares);
+        if (price === 0) throw new Error(`Buying ${shares} ${stock.sym} failed`);
+
+        budget -= shares * price;
+        stock.owned += shares;
+        ns.print(`BOUGHT ${ns.format.number(shares, 0)} ${stock.sym} @ ${ns.format.number(price)} (forecast ${pct(stock.forecast)}, target ${ns.format.number(targetValue)})`);
     }
 }
 
-function safeBool(fn) {
-    try {
-        return Boolean(fn());
-    } catch {
-        return false;
-    }
+/**
+ * @param {NS} ns
+ * @param {Quote} stock
+ * @param {number} shares
+ * @param {Fees} fees
+ * @param {string} reason
+ * @returns {number} realized profit
+ */
+function sell(ns, stock, shares, fees, reason) {
+    const price = ns.stock.sellStock(stock.sym, shares);
+    if (price === 0) throw new Error(`Selling ${shares} ${stock.sym} failed`);
+
+    const gain = (price - stock.avgPrice) * shares - 2 * fees.commission;
+    ns.print(`SOLD ${ns.format.number(shares, 0)} ${stock.sym} @ ${ns.format.number(price)} (${reason}, P/L ${ns.format.number(gain)})`);
+    stock.owned -= shares;
+
+    return gain;
+}
+
+/**
+ * The most the portfolio may hold: INVEST_FRACTION of net worth, never leaving less than CASH_FLOOR in cash.
+ * @param {NS} ns
+ * @param {Quote[]} quotes
+ */
+function stockBudget(ns, quotes) {
+    const netWorth = ns.getServerMoneyAvailable("home") + value(quotes);
+
+    return Math.min(netWorth * INVEST_FRACTION, netWorth - CASH_FLOOR);
+}
+
+/** @param {Quote[]} quotes */
+function value(quotes) {
+    return quotes.reduce((total, stock) => total + stock.owned * stock.bid, 0);
+}
+
+/**
+ * @param {NS} ns
+ * @param {number} realizedProfit
+ */
+function printSummary(ns, realizedProfit) {
+    const quotes = ns.stock.getSymbols().map(sym => quote(ns, sym));
+    const held = quotes.filter(stock => stock.owned > 0).sort((a, b) => b.owned * b.bid - a.owned * a.bid);
+    const unrealized = held.reduce((total, stock) => total + (stock.bid - stock.avgPrice) * stock.owned, 0);
+    const positions = held.map(stock => `${stock.sym} ${ns.format.number(stock.owned * stock.bid)} (${pct(stock.forecast)})`).join(", ");
+    ns.print(`Portfolio ${ns.format.number(value(quotes))}: ${positions || "nothing"} | realized ${ns.format.number(realizedProfit)}, unrealized ${ns.format.number(unrealized)}`);
+}
+
+/** @param {number} fraction */
+function pct(fraction) {
+    return `${(fraction * 100).toFixed(1)}%`;
 }

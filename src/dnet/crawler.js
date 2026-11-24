@@ -1,8 +1,10 @@
+import { CRAWLER_VERSION as VERSION, SHARED_FILE, report } from "/dnet/shared.js";
+
 const CRAWLER = "dnet/crawler.js";
 const LEGACY_WORM = "dnet/worm.js";
 const PHISH = "dnet/phish.js";
-const VERSION = 1;
 const LOOP_MS = 5000;
+const reportedFailures = new Set();
 
 /** @type {Record<string, (details: { data: string, passwordHint: string, passwordLength: number }) => string[]>} */
 const PASSWORD_GUESSES = {
@@ -37,7 +39,7 @@ export async function main(ns) {
 function openCaches(ns, here) {
     for (const cache of ns.ls(here, ".cache")) {
         const result = ns.dnet.openCache(cache, true);
-        record(ns, `cache ${here}/${cache}: ${result.message}`);
+        report(ns, "cache", `${cache}: ${result.message}`);
     }
 }
 
@@ -53,7 +55,7 @@ async function spreadTo(ns, host) {
     if (ns.isRunning(CRAWLER, host, VERSION)) return;
 
     ns.scriptKill(CRAWLER, host);
-    ns.scp([CRAWLER, PHISH], host);
+    ns.scp([CRAWLER, PHISH, SHARED_FILE], host);
     ns.exec(CRAWLER, host, 1, VERSION);
 }
 
@@ -82,24 +84,17 @@ async function crack(ns, host, details) {
         const result = await ns.dnet.authenticate(host, password);
         if (!result.success) continue;
 
-        record(ns, `cracked ${host} (${details.modelId}) password "${password}"`);
+        report(ns, "cracked", `${host} (${details.modelId}) password "${password}"`);
 
         return true;
     }
 
-    record(ns, `failed ${host} (${details.modelId}) hint "${details.passwordHint}" data "${details.data}"`);
+    if (!reportedFailures.has(host)) {
+        reportedFailures.add(host);
+        report(ns, "failed", `${host} (${details.modelId}) hint "${details.passwordHint}" data "${details.data}"`);
+    }
 
     return false;
-}
-
-/**
- * @param {NS} ns
- * @param {string} line
- */
-function record(ns, line) {
-    const logFile = `dnet/log-${ns.getHostname().replace(/[^A-Za-z0-9_-]/g, "_")}.txt`;
-    ns.write(logFile, `${line}\n`, "a");
-    ns.scp(logFile, "home");
 }
 
 /**
