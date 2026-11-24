@@ -1,8 +1,7 @@
-const BUY_FORECAST = 0.6;
+const BUY_FORECAST = 0.55;
 const SELL_FORECAST = 0.5;
 const INVEST_FRACTION = 0.8;
 const CASH_FLOOR = 20e9;
-const TOP_PICKS = 6;
 const REBALANCE_BAND = 0.25;
 const MIN_TRADE_COMMISSIONS = 1000;
 const SUMMARY_EVERY_TICKS = 10;
@@ -76,14 +75,14 @@ function expectedReturn(stock) {
 }
 
 /**
- * Splits the stock budget over the strongest picks in proportion to their expected return, so a stronger forecast gets more money.
- * Holdings outside the picks that are still above SELL_FORECAST keep their current value.
+ * Splits the stock budget over every stock at or above BUY_FORECAST in proportion to its expected return, so a stronger
+ * forecast gets more money. Holdings between SELL_FORECAST and BUY_FORECAST keep their current value.
  * @param {NS} ns
  * @param {Quote[]} quotes
  * @returns {Target[]}
  */
 function allocationTargets(ns, quotes) {
-    const picks = quotes.filter(stock => stock.forecast >= BUY_FORECAST).sort((a, b) => expectedReturn(b) - expectedReturn(a)).slice(0, TOP_PICKS);
+    const picks = quotes.filter(stock => stock.forecast >= BUY_FORECAST).sort((a, b) => expectedReturn(b) - expectedReturn(a));
     const held = quotes.filter(stock => stock.owned > 0 && !picks.includes(stock));
     const budget = stockBudget(ns, quotes) - value(held);
     const totalWeight = picks.reduce((total, stock) => total + expectedReturn(stock), 0);
