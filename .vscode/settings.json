@@ -1,0 +1,9 @@
+{
+    "bitburnerSync.port": 12525,
+    "bitburnerSync.autoSync": true,
+    "bitburnerSync.targetServer": "home",
+    "bitburnerSync.autoStart": false,
+    "bitburnerSync.autoDownloadDefinitions": true,
+    "bitburnerSync.fileExtensions": [".js"],
+    "bitburnerSync.syncDirectory": "src"
+}
