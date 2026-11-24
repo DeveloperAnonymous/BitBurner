@@ -1,29 +1,39 @@
-import { CRAWLER_FILE as CRAWLER, CRAWLER_FILES, CRAWLER_VERSION as VERSION, PHISH_FILE as PHISH, VERSION_PORT, report } from "/dnet/shared.js";
-import { crackPassword } from "/dnet/solvers.js";
+import { CRACKER_FILE as CRACKER, CRAWLER_FILE as CRAWLER, CRAWLER_VERSION as VERSION, LEGACY_WORM_FILE as LEGACY_WORM, PHISH_FILE as PHISH, VERSION_PORT, report } from "/dnet/shared.js";
 
-const LEGACY_WORM = "dnet/worm.js";
-const LOOP_MS = 5000;
+const LOOP_MS = 2000;
+const RETRY_MS = 5 * 60 * 1000;
+const REWARD_FILE = /\.(exe|cct|lit)$/;
 const reportedFailures = new Set();
+const reportedRewards = new Set();
 
-/** @param {NS} ns */
+/**
+ * @typedef {{ attempts: number, retryAt: number }} CrackRecord
+ */
+
+/**
+ * Coordinates one darknet node: hands each neighbor without a current crawler to its own cracker.js, so a slow crack
+ * never holds up spreading. Phishing only gets RAM that crackers do not need.
+ * @param {NS} ns
+ */
 export async function main(ns) {
     ns.disableLog("ALL");
 
     const here = ns.getHostname();
     ns.scriptKill(LEGACY_WORM, here);
     ns.scriptKill(PHISH, here);
+    /** @type {Map<string, CrackRecord>} */
+    const crackRecords = new Map();
 
     while (!isOutdated(ns)) {
-        await freeBlockedRam(ns, here);
         openCaches(ns, here);
+        reportRewards(ns, here);
 
-        for (const host of ns.dnet.probe()) {
-            if (isOutdated(ns)) break;
-
-            await spreadTo(ns, host);
-        }
+        const cracking = crackersRunning(ns, here);
+        const uncrawled = ns.dnet.probe().filter(host => needsCrawler(ns, host) && !cracking.has(host));
+        for (const host of uncrawled) startCracker(ns, here, host, crackRecords);
 
         startPhishing(ns, here);
+        await freeOwnBlockedRam(ns, here);
         await ns.sleep(LOOP_MS);
     }
 
@@ -41,25 +51,6 @@ function isOutdated(ns) {
 }
 
 /**
- * Frees RAM the server owner blocks, until none is left or a call frees nothing.
- * @param {NS} ns
- * @param {string} host
- */
-async function freeBlockedRam(ns, host) {
-    for (let blocked = ns.dnet.getBlockedRam(host); blocked > 0; ) {
-        const result = await ns.dnet.memoryReallocation(host);
-        const stillBlocked = ns.dnet.getBlockedRam(host);
-        if (!result.success || stillBlocked >= blocked) {
-            reportOnce(ns, `realloc:${host}`, `${host}: freeing ${blocked} GB blocked RAM stalled (${result.code} ${result.message})`);
-
-            return;
-        }
-
-        blocked = stillBlocked;
-    }
-}
-
-/**
  * @param {NS} ns
  * @param {string} here
  */
@@ -71,45 +62,75 @@ function openCaches(ns, here) {
 }
 
 /**
- * Hosts the player unlocked by hand show root access, so they are deployed to without cracking.
+ * Reports each program, contract and literature file on this node once. dnet/start.js copies the literature home and
+ * contracts.js solves the contracts; programs cannot be copied by scripts.
  * @param {NS} ns
- * @param {string} host
+ * @param {string} here
  */
-async function spreadTo(ns, host) {
-    const details = ns.dnet.getServerDetails(host);
-    if (!details.isOnline || !details.isConnectedToCurrentServer) return;
+function reportRewards(ns, here) {
+    const newRewards = ns.ls(here).filter(file => REWARD_FILE.test(file) && !reportedRewards.has(file));
 
-    const unlockedByHand = !details.hasSession && ns.hasRootAccess(host);
-    if (!details.hasSession && !unlockedByHand && !(await crack(ns, host, details))) return;
+    for (const file of newRewards) {
+        reportedRewards.add(file);
+        report(ns, "loot", file);
+    }
+}
 
-    ns.scriptKill(LEGACY_WORM, host);
-    if (ns.isRunning(CRAWLER, host, VERSION)) return;
-
-    await freeBlockedRam(ns, host);
-    deployCrawler(ns, host, unlockedByHand);
+/**
+ * @param {NS} ns
+ * @param {string} here
+ * @returns {Set<string>} hosts a cracker on this node is working on
+ */
+function crackersRunning(ns, here) {
+    return new Set(ns.ps(here).filter(process => process.filename === CRACKER).map(process => String(process.args[0])));
 }
 
 /**
  * @param {NS} ns
  * @param {string} host
- * @param {boolean} unlockedByHand
  */
-function deployCrawler(ns, host, unlockedByHand) {
-    const access = unlockedByHand ? "unlocked by hand, no script session" : "script session";
-    ns.scriptKill(CRAWLER, host);
-    if (!ns.scp(CRAWLER_FILES, host)) {
-        reportOnce(ns, `scp:${host}`, `${host}: copying crawler files failed (${access})`);
+function needsCrawler(ns, host) {
+    const details = ns.dnet.getServerDetails(host);
 
-        return;
+    return details.isOnline && details.isConnectedToCurrentServer && !ns.isRunning(CRAWLER, host, VERSION);
+}
+
+/**
+ * Starts a cracker for the host unless its last failed try is still cooling down.
+ * @param {NS} ns
+ * @param {string} here
+ * @param {string} host
+ * @param {Map<string, CrackRecord>} crackRecords
+ */
+function startCracker(ns, here, host, crackRecords) {
+    const record = crackRecords.get(host) ?? { attempts: 0, retryAt: 0 };
+    if (Date.now() < record.retryAt) return;
+
+    const tryNumber = record.attempts + 1;
+    if (!execCracker(ns, here, host, tryNumber)) return;
+
+    crackRecords.set(host, { attempts: tryNumber, retryAt: Date.now() + RETRY_MS });
+}
+
+/**
+ * Stops phishing when that is what keeps the cracker from fitting.
+ * @param {NS} ns
+ * @param {string} here
+ * @param {string} host
+ * @param {number} tryNumber
+ * @returns {boolean} whether the cracker started
+ */
+function execCracker(ns, here, host, tryNumber) {
+    if (ns.exec(CRACKER, here, 1, host, tryNumber) !== 0) return true;
+
+    if (ns.isRunning(PHISH, here)) {
+        ns.scriptKill(PHISH, here);
+        if (ns.exec(CRACKER, here, 1, host, tryNumber) !== 0) return true;
     }
 
-    if (ns.exec(CRAWLER, host, 1, VERSION) === 0) {
-        reportOnce(ns, `exec:${host}`, `${host}: starting crawler failed (${access}, free RAM ${ns.getServerMaxRam(host) - ns.getServerUsedRam(host)} GB)`);
+    reportOnce(ns, `cracker:${host}`, `no RAM to crack ${host} (free ${ns.getServerMaxRam(here) - ns.getServerUsedRam(here)} GB, cracker needs ${ns.getScriptRam(CRACKER)} GB)`);
 
-        return;
-    }
-
-    if (unlockedByHand) report(ns, "cracked", `${host}: deployed to hand-unlocked node`);
+    return false;
 }
 
 /**
@@ -124,22 +145,15 @@ function startPhishing(ns, here) {
 }
 
 /**
+ * One reallocation per pass, so the crawler is never stuck freeing RAM.
  * @param {NS} ns
- * @param {string} host
- * @param {ReturnType<NS["dnet"]["getServerDetails"]>} details
+ * @param {string} here
  */
-async function crack(ns, host, details) {
-    const outcome = await crackPassword(ns, host, details);
-    if ("password" in outcome) {
-        report(ns, "cracked", `${host} (${details.modelId}) password "${outcome.password}"`);
+async function freeOwnBlockedRam(ns, here) {
+    if (ns.dnet.getBlockedRam(here) <= 0) return;
 
-        return true;
-    }
-
-    const describe = `${host} (${details.modelId}) hint "${details.passwordHint}" data "${details.data}" length ${details.passwordLength} ${details.passwordFormat}`;
-    reportOnce(ns, `crack:${host}`, `${describe}: ${outcome.failure}`);
-
-    return false;
+    const result = await ns.dnet.memoryReallocation();
+    if (!result.success) reportOnce(ns, `realloc:${here}`, `freeing blocked RAM failed (${result.code} ${result.message})`);
 }
 
 /**

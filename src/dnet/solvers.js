@@ -7,7 +7,7 @@
  */
 
 const STATED_PASSWORD = /(?:password|passcode|pin|code|key|secret|pw)\s*(?:is|:|=)\s*["']?([^\s"'.!,;]+)/i;
-const SET_TO_PASSWORD = /(?:set|left|changed)\s+to\s*["']?([^\s"'.!,;]+)/i;
+const WORD_SEPARATORS = /[^a-z0-9]+/i;
 const RANGE_HINT = /between\s+(-?\d+)\s+and\s+(-?\d+)/i;
 const BASE_HINT = /base\s+(\d+)\s+number\s+([0-9a-z]+)/i;
 const ROMAN_HINT = /['"]([IVXLCDM]+)['"]/i;
@@ -15,7 +15,6 @@ const LETTER_CLUE = /(?:see\s+an?\s+|letter\s+|char(?:acter)?\s+)([a-z0-9])\b/gi
 const MASTERMIND_FEEDBACK = /(\d+)\s+symbols?\s+are\s+match(?:ed)?\s+exactly,\s*(?:and\s*)?(\d+)\s+symbols?\s+match/i;
 const DEFAULT_PASSWORD_HINT = /default\s+password/i;
 
-const FILLER_WORDS = new Set(["the", "a", "an", "default", "your", "my", "blank", "empty", "none"]);
 const COMMON_DEFAULTS = ["0000", "1111", "1234", "4321", "9999", "2580", "1337", "7777", "8888", "00000", "11111", "12345", "54321", "99999", "admin", "password"];
 const OVERFLOW_EXTRA_CHARS = [1, 4];
 const OVERFLOW_FILLERS = ["A", "a", "1", "0"];
@@ -31,7 +30,7 @@ const SOLVERS = {
         yield "";
     },
     "FreshInstall_1.0": async function* ({ details }) {
-        yield* COMMON_DEFAULTS.filter(password => password.length === details.passwordLength);
+        yield* COMMON_DEFAULTS.filter(password => fitsFormat(password, details));
     },
     "DeskMemo_3.1": async function* (target) {
         yield* statedPasswords(target.details);
@@ -82,7 +81,7 @@ export async function crackPassword(ns, host, details) {
 
     while (!step.done) {
         const password = step.value;
-        if (tried.has(password) || !fitsFormat(password, details)) {
+        if (tried.has(password)) {
             step = await guesses.next();
             continue;
         }
@@ -100,11 +99,16 @@ export async function crackPassword(ns, host, details) {
     return { failure: `${solverName} solver tried ${tried.size} passwords; last response ${lastResponse}` };
 }
 
-/** @param {Target} target */
+/**
+ * Ends with one plain guess so the failure report shows how the unknown model answers a wrong password.
+ * @param {Target} target
+ */
 async function* genericPasswords(target) {
-    yield* statedPasswords(target.details);
-    if (DEFAULT_PASSWORD_HINT.test(target.details.passwordHint)) yield* COMMON_DEFAULTS;
+    const { details } = target;
+    yield* statedPasswords(details);
+    if (DEFAULT_PASSWORD_HINT.test(details.passwordHint)) yield* COMMON_DEFAULTS.filter(password => fitsFormat(password, details));
     yield* leakedPasswords(target);
+    yield (details.passwordFormat === "numeric" ? "0" : "a").repeat(details.passwordLength);
 }
 
 /**
@@ -117,11 +121,12 @@ function fitsFormat(password, details) {
     return details.passwordFormat !== "numeric" || /^\d*$/.test(password);
 }
 
-/** @param {ServerDetails} details */
+/**
+ * Every word in the hint and data that fits the password's length and format, e.g. "576" in "The secret is 576".
+ * @param {ServerDetails} details
+ */
 function statedPasswords(details) {
-    return [details.passwordHint, details.data]
-        .flatMap(text => [text.match(STATED_PASSWORD)?.[1], text.match(SET_TO_PASSWORD)?.[1]])
-        .filter(word => word !== undefined && !FILLER_WORDS.has(word.toLowerCase()));
+    return `${details.passwordHint} ${details.data}`.split(WORD_SEPARATORS).filter(word => fitsFormat(word, details));
 }
 
 /** @param {Target} target */

@@ -1,6 +1,7 @@
 import { SOLVERS } from "/contracts/solvers.js";
 
 const SCAN_INTERVAL_MS = 60000;
+const DARKNET_HOSTS_FILE = "dnet/hosts.txt";
 
 /** @param {NS} ns */
 export async function main(ns) {
@@ -30,6 +31,7 @@ export async function main(ns) {
 }
 
 /**
+ * Scans the regular network from home, plus the darknet nodes dnet/start.js has recorded, since scan cannot reach them.
  * @param {NS} ns
  * @returns {{ host: string, file: string }[]}
  */
@@ -44,7 +46,9 @@ function findContracts(ns) {
         }
     }
 
-    return [...seen].flatMap(host => ns.ls(host, ".cct").map(file => ({ host, file })));
+    const darknet = ns.read(DARKNET_HOSTS_FILE).split("\n").filter(host => host !== "" && ns.serverExists(host));
+
+    return [...new Set([...seen, ...darknet])].flatMap(host => ns.ls(host, ".cct").map(file => ({ host, file })));
 }
 
 /**

@@ -1,4 +1,5 @@
 import { reportFailure } from "/lib/report.js";
+import { SHARE_SCRIPT, shareReserve, shareThreads } from "/lib/share-reserve.js";
 
 const HACK_SCRIPT = "/batch/hack.js";
 const GROW_SCRIPT = "/batch/grow.js";
@@ -52,6 +53,7 @@ export async function main(ns) {
         scriptRam = readScriptRam(ns);
     }
 
+    const shareThreadRam = ns.getScriptRam(SHARE_SCRIPT, "home");
     /** @type {Map<string, number[]>} */
     const busyTargets = new Map();
     let loop = 0;
@@ -62,7 +64,7 @@ export async function main(ns) {
         const hosts = copyBatchScripts(ns, workerHosts(ns, servers));
         releaseFinishedTargets(ns, busyTargets);
 
-        let pool = freeRamByHost(ns, hosts);
+        let pool = freeRamByHost(ns, hosts, shareThreadRam);
         const freeTargets = rankedTargets(ns, servers).filter(target => !busyTargets.has(target));
         for (const [index, target] of freeTargets.entries()) {
             const allotment = { pool, ramShare: totalFreeRam(pool) / (freeTargets.length - index) };
@@ -450,12 +452,19 @@ function prepJobs(ns, target, capacity, timing, prepRam) {
 }
 
 /**
+ * Free RAM minus the part of each host's share reserve that share threads have not claimed yet.
  * @param {NS} ns
  * @param {string[]} hosts
+ * @param {number} shareThreadRam
  * @returns {Map<string, number>}
  */
-function freeRamByHost(ns, hosts) {
-    return new Map(hosts.map(host => [host, ns.getServerMaxRam(host) - ns.getServerUsedRam(host)]));
+function freeRamByHost(ns, hosts, shareThreadRam) {
+    return new Map(hosts.map(host => {
+        const maxRam = ns.getServerMaxRam(host);
+        const unclaimedReserve = Math.max(0, shareReserve(host, maxRam) - shareThreads(ns, host) * shareThreadRam);
+
+        return [host, Math.max(0, maxRam - ns.getServerUsedRam(host) - unclaimedReserve)];
+    }));
 }
 
 /**
