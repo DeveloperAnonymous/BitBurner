@@ -1,70 +1,138 @@
+const SPEND_FRACTION = 0.5;
+const MIN_RAM = 8;
+const NAME_PREFIX = "cloud-";
+const WAIT_MS = 15000;
+
+/**
+ * @typedef {{ label: string, ram: number, cost: number, buy: () => boolean }} Purchase
+ */
+
 /** @param {NS} ns */
 export async function main(ns) {
-    ns.disableLog("sleep");
-    ns.disableLog("getServerMaxRam");
-
-    const keepRatio = 0.5; // Keep 50% of cash untouched in your account
-    const startingRam = 8; // Starting RAM size in GB for new cloud servers
-    const sleepMs = 15000;
+    ns.disableLog("ALL");
 
     while (true) {
-        const money = ns.getServerMoneyAvailable("home");
-        const spendable = Math.max(0, money * (1 - keepRatio));
-
-        const serverLimit = ns.cloud.getServerLimit();
-        const purchasedServers = ns.cloud.getServerNames();
-        const maxPossibleRam = ns.cloud.getRamLimit();
-
-        // Determine target RAM for next purchase or upgrade
-        let targetRam = startingRam;
-        if (purchasedServers.length > 0) {
-            const minRam = purchasedServers.reduce((min, srv) => {
-                const ram = ns.getServerMaxRam(srv);
-                return ram < min ? ram : min;
-            }, ns.getServerMaxRam(purchasedServers[0]));
-            targetRam = purchasedServers.length < serverLimit ? startingRam : minRam * 2;
+        const purchase = nextPurchase(ns, ns.getServerMoneyAvailable("home") * SPEND_FRACTION);
+        if (purchase === null) {
+            ns.print(`Nothing affordable with half the cash. Next step: ${describeNextStep(ns)}`);
+            await ns.sleep(WAIT_MS);
+            continue;
         }
 
-        if (targetRam > maxPossibleRam) {
-            targetRam = maxPossibleRam;
+        if (!purchase.buy()) {
+            throw new Error(`${purchase.label} at ${ns.format.ram(purchase.ram)} for $${ns.format.number(purchase.cost)} failed`);
         }
 
-        const newServerCost = ns.cloud.getServerCost(targetRam);
-        const shortfall = Math.max(0, newServerCost - spendable);
-
-        // Printed right after getServerMoneyAvailable logs the player's money
-        ns.print(
-            `🖥️ Need $${ns.format.number(newServerCost)} (spendable 50%: $${ns.format.number(spendable)}) ` +
-            `for a ${ns.format.ram(targetRam)} cloud server` +
-            (shortfall > 0 ? ` ($${ns.format.number(shortfall)} more needed)` : " (Affordable within budget!)")
-        );
-
-        // Buy a new cloud server if below limit and affordable within spendable budget
-        if (purchasedServers.length < serverLimit) {
-            if (spendable >= newServerCost && newServerCost > 0) {
-                const hostname = ns.cloud.purchaseServer(`cloud-${purchasedServers.length}`, targetRam);
-                if (hostname) {
-                    ns.print(`✅ Purchased new cloud server ${hostname} (${ns.format.ram(targetRam)})`);
-                }
-            }
-        } else if (purchasedServers.length > 0) {
-            // Upgrade the smallest cloud server when at server limit
-            const weakest = purchasedServers.reduce((best, srv) =>
-                ns.getServerMaxRam(srv) < ns.getServerMaxRam(best) ? srv : best
-            );
-            const currentWeakestRam = ns.getServerMaxRam(weakest);
-            const nextRam = Math.min(maxPossibleRam, currentWeakestRam * 2);
-
-            if (nextRam > currentWeakestRam) {
-                const upgradeCost = ns.cloud.getServerUpgradeCost(weakest, nextRam);
-                if (spendable >= upgradeCost && upgradeCost > 0) {
-                    if (ns.cloud.upgradeServer(weakest, nextRam)) {
-                        ns.print(`⬆️ Upgraded ${weakest} to ${ns.format.ram(nextRam)}`);
-                    }
-                }
-            }
-        }
-
-        await ns.sleep(sleepMs);
+        ns.print(`${purchase.label} at ${ns.format.ram(purchase.ram)} for $${ns.format.number(purchase.cost)}`);
+        await ns.sleep();
     }
+}
+
+/**
+ * @param {NS} ns
+ * @param {number} budget
+ * @returns {Purchase | null}
+ */
+function nextPurchase(ns, budget) {
+    const names = ns.cloud.getServerNames();
+    if (names.length < ns.cloud.getServerLimit()) return newServerPurchase(ns, names, budget);
+
+    return upgradePurchase(ns, smallestServer(ns, names), budget);
+}
+
+/**
+ * @param {NS} ns
+ * @param {string[]} names
+ * @param {number} budget
+ * @returns {Purchase | null}
+ */
+function newServerPurchase(ns, names, budget) {
+    const ram = largestRam(ns, MIN_RAM, size => ns.cloud.getServerCost(size) <= budget);
+    if (ram === null) return null;
+
+    const hostname = unusedName(names);
+
+    return {
+        label: `Bought ${hostname}`,
+        ram,
+        cost: ns.cloud.getServerCost(ram),
+        buy: () => ns.cloud.purchaseServer(hostname, ram) === hostname,
+    };
+}
+
+/**
+ * @param {NS} ns
+ * @param {string} host
+ * @param {number} budget
+ * @returns {Purchase | null}
+ */
+function upgradePurchase(ns, host, budget) {
+    const ram = largestRam(ns, ns.getServerMaxRam(host) * 2, size => ns.cloud.getServerUpgradeCost(host, size) <= budget);
+    if (ram === null) return null;
+
+    return {
+        label: `Upgraded ${host}`,
+        ram,
+        cost: ns.cloud.getServerUpgradeCost(host, ram),
+        buy: () => ns.cloud.upgradeServer(host, ram),
+    };
+}
+
+/**
+ * Cloud server RAM must be a power of two.
+ * @param {NS} ns
+ * @param {number} smallest
+ * @param {(ram: number) => boolean} isAffordable
+ * @returns {number | null}
+ */
+function largestRam(ns, smallest, isAffordable) {
+    const ramLimit = ns.cloud.getRamLimit();
+    let best = null;
+
+    for (let ram = smallest; ram <= ramLimit && isAffordable(ram); ram *= 2) {
+        best = ram;
+    }
+
+    return best;
+}
+
+/**
+ * @param {NS} ns
+ * @param {string[]} names
+ * @returns {string}
+ */
+function smallestServer(ns, names) {
+    return names.reduce((smallest, name) => (ns.getServerMaxRam(name) < ns.getServerMaxRam(smallest) ? name : smallest));
+}
+
+/**
+ * @param {string[]} names
+ * @returns {string}
+ */
+function unusedName(names) {
+    const taken = new Set(names);
+    let index = 0;
+
+    while (taken.has(`${NAME_PREFIX}${index}`)) {
+        index++;
+    }
+
+    return `${NAME_PREFIX}${index}`;
+}
+
+/**
+ * @param {NS} ns
+ * @returns {string}
+ */
+function describeNextStep(ns) {
+    const names = ns.cloud.getServerNames();
+    if (names.length < ns.cloud.getServerLimit()) {
+        return `new ${ns.format.ram(MIN_RAM)} server for $${ns.format.number(ns.cloud.getServerCost(MIN_RAM))}`;
+    }
+
+    const host = smallestServer(ns, names);
+    const ram = ns.getServerMaxRam(host) * 2;
+    if (ram > ns.cloud.getRamLimit()) return "all servers are at the RAM limit";
+
+    return `${host} to ${ns.format.ram(ram)} for $${ns.format.number(ns.cloud.getServerUpgradeCost(host, ram))}`;
 }

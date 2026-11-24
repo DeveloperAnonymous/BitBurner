@@ -1,3 +1,4 @@
 .vscode/settings.json
 NetscriptDefinitions.d.ts
 NetscriptGlobals.d.ts
+mcp/node_modules/

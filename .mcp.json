@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "bitburner": {
+      "command": "node",
+      "args": ["mcp/server.js"]
+    }
+  }
+}

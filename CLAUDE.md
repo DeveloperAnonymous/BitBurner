@@ -4,7 +4,7 @@ Scripts for the game Bitburner (bitburner-official/bitburner-src). Target versio
 
 ## Hard limits
 
-- Claude cannot run the game. The user runs scripts in the game terminal and pastes the output back. Never claim a script works.
+- Claude cannot play the game. Through the `bitburner` MCP server it can read state, check RAM and, with the user's go-ahead, start scripts and read their logs (see Sync workflow). Never claim a script works without its log or the user's output.
 - With every new or changed script, give the exact terminal command (`run /path/script.js -t N arg1 arg2`) and the expected RAM cost.
 - Never guess an `ns` function signature or RAM cost. Read the docs first (see Docs).
 
@@ -48,9 +48,13 @@ Scripts for the game Bitburner (bitburner-official/bitburner-src). Target versio
 
 ## Sync workflow
 
-- Sync uses the VS Code extension `FicocelliGuy.bitburner-file-sync-plugin` (listed in the dev-branch Remote API docs, not yet in stable) over the game's Remote API (the old API server and `bitburner.authToken` were removed in game 3.0.0). Settings are `bitburnerSync.*` in `.vscode/settings.json` (port 12525, target `home`, sync directory `src`, only `.js` files, auto sync on save, server starts with VS Code).
-- In the game the user connects by hand: Options, Remote API, hostname `localhost`, port `12525`, Connect. The connection drops when the machine sleeps and needs a reconnect.
-- Remote API methods include `pushFile`, `getFile`, `deleteFile`, `getAllFiles`, `calculateRam` and `getDefinitionFile`.
+- The project MCP server `bitburner` (`mcp\server.js`, registered in `.mcp.json`) owns the game's Remote API connection on port 12525. The game connects out to one tool only, so the VS Code plugin `FicocelliGuy.bitburner-file-sync-plugin` must stay stopped (`bitburnerSync.autoStart` is false).
+- While a Claude Code session runs here, the MCP server watches `src\` and pushes each saved `.js` file to `home` (`src\lib\x.js` becomes `lib/x.js`). It deletes files removed locally, and on connect it pushes all of `src\` and rewrites `NetscriptDefinitions.d.ts` from the game. Outside a Claude session nothing syncs, unless the user starts the VS Code plugin instead.
+- In the game the user connects by hand: Options, Remote API, hostname `localhost`, port `12525`, Connect. The connection drops when the machine sleeps or the MCP server restarts and needs a reconnect.
+- MCP tools: `game_status`, `player_info`, `list_servers`, `server_info`, `list_files`, `read_file`, `write_file`, `delete_file`, `calculate_ram`, `sync_all`, plus `run_script`, `script_logs`, `list_processes`, `kill_script` and `eval_ns`. Those five go through `src\mcp-runner.js`, which must be running on home (`run /mcp-runner.js`).
+- `eval_ns` runs any NS code (the body of an async function with `ns` in scope, returning a JSON value) as a one-shot script on home, so the game computes its RAM. Prefer it over writing throwaway scripts for queries.
+- UI tools (`ui_screen_text`, `ui_click`, `ui_terminal`, `ui_eval`, `ui_screenshot`) drive the Steam game window over Chrome DevTools on port 9222. They need `--remote-debugging-port=9222` in Bitburner's Steam launch options. Use them only for what the NS API cannot do (for example Create Program or buying TOR without Source-File 4), and only when the user asks.
+- Use `calculate_ram` to give the real RAM cost of a new or changed script, and `player_info` or `server_info` instead of asking the user for state. Never run a script with `run_script` that the user has not asked for.
 - `.vscode/settings.json` is gitignored. Do not add secrets to it.
 
 ## Types
