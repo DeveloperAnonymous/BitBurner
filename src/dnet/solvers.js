@@ -9,6 +9,7 @@
 const STATED_PASSWORD = /(?:password|passcode|pin|code|key|secret|pw)\s*(?:is|:|=)\s*["']?([^\s"'.!,;]+)/i;
 const WORD_SEPARATORS = /[^a-z0-9]+/i;
 const RANGE_HINT = /between\s+(-?\d+)\s+and\s+(-?\d+)/i;
+const DIVISOR_HINT = /divisible\s+by\s+(\d+)/i;
 const BASE_HINT = /base\s+(\d+)\s+number\s+([0-9a-z]+)/i;
 const ROMAN_HINT = /['"]([IVXLCDM]+)['"]/i;
 const LETTER_CLUE = /(?:see\s+an?\s+|letter\s+|char(?:acter)?\s+)([a-z0-9])\b/gi;
@@ -51,6 +52,10 @@ const SOLVERS = {
         yield* overflowPasswords(target.details);
     },
     "DeepGreen": mastermindPasswords,
+    "Factori-Os": async function* (target) {
+        yield* statedPasswords(target.details);
+        yield* multiplePasswords(target.details);
+    },
     "Laika4": async function* (target) {
         yield* statedPasswords(target.details);
         yield* letterCluePasswords(target);
@@ -90,7 +95,7 @@ export async function crackPassword(ns, host, details) {
         const result = await ns.dnet.authenticate(host, password);
         if (result.success) return { password };
 
-        lastResponse = `${result.code} ${result.message}`;
+        lastResponse = `${result.code} ${result.message}${result.data === undefined ? "" : ` data ${JSON.stringify(result.data)}`} (guess "${password}")`;
         step = await guesses.next(result);
     }
 
@@ -107,6 +112,7 @@ async function* genericPasswords(target) {
     const { details } = target;
     yield* statedPasswords(details);
     if (DEFAULT_PASSWORD_HINT.test(details.passwordHint)) yield* COMMON_DEFAULTS.filter(password => fitsFormat(password, details));
+    yield* multiplePasswords(details);
     yield* leakedPasswords(target);
     yield (details.passwordFormat === "numeric" ? "0" : "a").repeat(details.passwordLength);
 }
@@ -147,6 +153,28 @@ function* rangePasswords(details) {
 
     for (let value = Math.max(0, Math.min(low, high)); value <= Math.max(low, high); value++) {
         yield String(value).padStart(details.passwordLength, "0");
+    }
+}
+
+/**
+ * Every number with the password's digit count that the hint's divisor ("divisible by 7") divides, without a leading
+ * zero first, then the zero-padded ones. Gives up when there are more than MAX_BRUTE_FORCE.
+ * @param {ServerDetails} details
+ */
+function* multiplePasswords(details) {
+    const divisor = Number(details.passwordHint.match(DIVISOR_HINT)?.[1]);
+    const length = details.passwordLength;
+    if (!(divisor > 0) || details.passwordFormat !== "numeric" || 10 ** length / divisor > MAX_BRUTE_FORCE) return;
+
+    const smallestFull = length === 1 ? 0 : 10 ** (length - 1);
+    const firstMultiple = Math.ceil(smallestFull / divisor) * divisor;
+
+    for (let value = firstMultiple; value < 10 ** length; value += divisor) {
+        yield String(value);
+    }
+
+    for (let value = 0; value < smallestFull; value += divisor) {
+        yield String(value).padStart(length, "0");
     }
 }
 

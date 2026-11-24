@@ -11,6 +11,8 @@ const CELL_OF_CHAR = /** @type {Record<string, number>} */ ({ X: BLACK, O: WHITE
 const CHAR_OF_CELL = [".", "X", "O", "#"];
 
 const EXPLORATION = 0.7;
+const EARLY_STOP_PLAYOUTS_PER_MOVE = 30;
+const EARLY_STOP_VISIT_SHARE = 0.6;
 const PLAYOUT_LENGTH_PER_POINT = 3;
 const PAUSE_EVERY_MS = 40;
 
@@ -274,30 +276,38 @@ function emptyRegion(cells, neighbors, start, current) {
 }
 
 /**
- * Random game to the end: each side plays a random sensible move, or passes when it has none; two passes end it.
+ * Heavy playout to the end of the game. Each side first answers the previous move tactically (capture it if it is in
+ * atari, rescue its own chain the move put in atari), otherwise plays a random sensible move that is not self-atari,
+ * otherwise passes; two passes end it. Pure random play misjudges life and death, which made win rates swing wildly.
  * @param {Int8Array} cells mutated
  * @param {number[][]} neighbors
- * @param {number} toMove
+ * @param {TreeNode} leaf the position's node: who moves next, and the move that led here (-1 at the root)
  * @param {number} komi
  * @returns {number} winning color
  */
-function playout(cells, neighbors, toMove, komi) {
+function playout(cells, neighbors, leaf, komi) {
     const candidates = [];
     const moveLimit = cells.length * PLAYOUT_LENGTH_PER_POINT;
-    let color = toMove;
+    let color = leaf.toMove;
+    let lastMove = leaf.move;
     let passes = 0;
 
     for (let moveCount = 0; moveCount < moveLimit && passes < 2; moveCount++) {
-        candidates.length = 0;
-        for (let point = 0; point < cells.length; point++) if (cells[point] === EMPTY) candidates.push(point);
+        let chosen = tacticalReply(cells, neighbors, lastMove, color);
 
-        const chosen = randomSensibleMove(cells, neighbors, candidates, color);
+        if (chosen === -1) {
+            candidates.length = 0;
+            for (let point = 0; point < cells.length; point++) if (cells[point] === EMPTY) candidates.push(point);
+            chosen = randomSensibleMove(cells, neighbors, candidates, color);
+        }
+
         if (chosen === -1) passes++;
         else {
             placeStone(cells, neighbors, chosen, color);
             passes = 0;
         }
 
+        lastMove = chosen;
         color = 3 - color;
     }
 
@@ -307,7 +317,31 @@ function playout(cells, neighbors, toMove, komi) {
 }
 
 /**
- * Draws candidates in random order until one is sensible.
+ * Captures the stone just played when it is left in atari, else saves a chain of the color's that it put in atari.
+ * @param {Int8Array} cells
+ * @param {number[][]} neighbors
+ * @param {number} lastMove the opponent's last stone, or -1 after a pass
+ * @param {number} color the side to move
+ * @returns {number} the point, or -1 when there is no urgent reply
+ */
+function tacticalReply(cells, neighbors, lastMove, color) {
+    if (lastMove < 0 || cells[lastMove] !== 3 - color) return -1;
+
+    const capturePoint = soleLiberty(cells, neighbors, lastMove);
+    if (capturePoint !== -1 && isLegal(cells, neighbors, capturePoint, color)) return capturePoint;
+
+    for (const next of neighbors[lastMove]) {
+        if (cells[next] !== color) continue;
+
+        const escapePoint = soleLiberty(cells, neighbors, next);
+        if (escapePoint !== -1 && isLegal(cells, neighbors, escapePoint, color) && !isSelfAtari(cells, neighbors, escapePoint, color)) return escapePoint;
+    }
+
+    return -1;
+}
+
+/**
+ * Draws candidates in random order until one is sensible and not self-atari.
  * @param {Int8Array} cells
  * @param {number[][]} neighbors
  * @param {number[]} candidates emptied as it draws
@@ -320,10 +354,64 @@ function randomSensibleMove(cells, neighbors, candidates, color) {
         const point = candidates[pick];
         candidates[pick] = candidates[candidates.length - 1];
         candidates.pop();
-        if (isLegal(cells, neighbors, point, color) && !isOwnEye(cells, neighbors, point, color)) return point;
+        if (!isLegal(cells, neighbors, point, color) || isOwnEye(cells, neighbors, point, color)) continue;
+        if (!isSelfAtari(cells, neighbors, point, color)) return point;
     }
 
     return -1;
+}
+
+/**
+ * @param {Int8Array} cells
+ * @param {number[][]} neighbors
+ * @param {number} start a stone
+ * @returns {number} the chain's only liberty, or -1 when it has none or more than one
+ */
+function soleLiberty(cells, neighbors, start) {
+    const color = cells[start];
+    const current = nextStamp(cells.length);
+    const stack = [start];
+    marks[start] = current;
+    let liberty = -1;
+
+    while (stack.length > 0) {
+        const point = /** @type {number} */ (stack.pop());
+
+        for (const next of neighbors[point]) {
+            if (marks[next] === current) continue;
+
+            const cell = cells[next];
+            marks[next] = current;
+            if (cell === color) stack.push(next);
+            if (cell !== EMPTY) continue;
+            if (liberty !== -1) return -1;
+
+            liberty = next;
+        }
+    }
+
+    return liberty;
+}
+
+/**
+ * A legal move that captures nothing and leaves the new chain with a single liberty.
+ * @param {Int8Array} cells
+ * @param {number[][]} neighbors
+ * @param {number} point
+ * @param {number} color
+ */
+function isSelfAtari(cells, neighbors, point, color) {
+    const enemy = 3 - color;
+
+    for (const next of neighbors[point]) {
+        if (cells[next] === enemy && !hasLiberties(cells, neighbors, next, 1, point)) return false;
+    }
+
+    cells[point] = color;
+    const inAtari = !hasLiberties(cells, neighbors, point, 2, -1);
+    cells[point] = EMPTY;
+
+    return inAtari;
 }
 
 /**
@@ -392,7 +480,7 @@ export async function searchBestMove(position, { komi, seenKeys, timeMs, pause }
     while (Date.now() < deadline || root.children.length === 0) {
         scratch.set(cells);
         const leaf = descend(root, scratch, neighbors);
-        const winner = playout(scratch, neighbors, leaf.toMove, komi);
+        const winner = playout(scratch, neighbors, leaf, komi);
 
         for (let node = /** @type {TreeNode | null} */ (leaf); node !== null; node = node.parent) {
             node.visits++;
@@ -400,6 +488,7 @@ export async function searchBestMove(position, { komi, seenKeys, timeMs, pause }
         }
 
         if (Date.now() - pausedAt < PAUSE_EVERY_MS) continue;
+        if (hasClearFavorite(root)) break;
 
         await pause();
         pausedAt = Date.now();
@@ -408,6 +497,18 @@ export async function searchBestMove(position, { komi, seenKeys, timeMs, pause }
     const best = root.children.reduce((most, child) => (child.visits > most.visits ? child : most));
 
     return { x: Math.floor(best.move / height), y: best.move % height, winRate: best.wins / best.visits, playouts: root.visits };
+}
+
+/**
+ * After enough playouts for every root move to be looked at properly, one move holding most of the visits will not be
+ * overtaken in the time left.
+ * @param {TreeNode} root
+ */
+function hasClearFavorite(root) {
+    const rootMoveCount = root.children.length + root.untried.length;
+    if (root.visits < rootMoveCount * EARLY_STOP_PLAYOUTS_PER_MOVE) return false;
+
+    return root.children.some(child => child.visits >= root.visits * EARLY_STOP_VISIT_SHARE);
 }
 
 /**
@@ -440,35 +541,39 @@ function descend(root, scratch, neighbors) {
 }
 
 /**
- * The fewest liberties any black chain has, or Infinity when black has no stones.
+ * Whether black wins if white passes now, and no legal white move captures black stones. A white move that only
+ * invades black's territory is not counted: the game goes on after it, and black answers by capturing the invader.
+ * Captures are what white could not be made to undo. Moves that superko would forbid are tested too, which only makes
+ * the answer more cautious.
  * @param {Position} position
+ * @param {number} komi
  */
-export function weakestBlackLiberties(position) {
+export function holdsAgainstEveryWhiteReply(position, komi) {
     const { cells, neighbors } = position;
-    let weakest = Infinity;
+    const score = areaScore(cells, neighbors);
+    if (score.black <= score.white + komi) return false;
+
+    const blackStones = stoneCount(cells, BLACK);
+    const scratch = new Int8Array(cells.length);
 
     for (let point = 0; point < cells.length; point++) {
-        if (cells[point] !== BLACK) continue;
+        if (!isLegal(cells, neighbors, point, WHITE)) continue;
 
-        weakest = Math.min(weakest, libertyCount(cells, neighbors, point));
+        scratch.set(cells);
+        placeStone(scratch, neighbors, point, WHITE);
+        if (stoneCount(scratch, BLACK) < blackStones) return false;
     }
 
-    return weakest;
+    return true;
 }
 
 /**
  * @param {Int8Array} cells
- * @param {number[][]} neighbors
- * @param {number} start
+ * @param {number} color
  */
-function libertyCount(cells, neighbors, start) {
+function stoneCount(cells, color) {
     let count = 0;
-    while (hasLiberties(cells, neighbors, start, count + 1, -1)) count++;
+    for (let point = 0; point < cells.length; point++) if (cells[point] === color) count++;
 
     return count;
-}
-
-/** @param {Position} position */
-export function emptyCount(position) {
-    return position.cells.reduce((count, cell) => count + (cell === EMPTY ? 1 : 0), 0);
 }

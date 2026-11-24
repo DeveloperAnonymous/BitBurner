@@ -14,6 +14,8 @@ const ACCESS_RECHECK_MS = 60000;
  * @typedef {{ sym: string, forecast: number, volatility: number, ask: number, bid: number, owned: number, avgPrice: number, maxShares: number }} Quote
  * @typedef {{ commission: number, minTrade: number }} Fees
  * @typedef {{ stock: Quote, targetValue: number }} Target
+ * @typedef {{ sym: string, proceeds: number, gain: number }} Sale
+ * @typedef {{ sym: string, cost: number }} Purchase
  */
 
 /** @param {NS} ns */
@@ -32,11 +34,12 @@ export async function main(ns) {
 
     while (true) {
         const quotes = ns.stock.getSymbols().map(sym => quote(ns, sym));
-        realizedProfit += sellWeakPositions(ns, quotes, fees);
-
+        const weakSales = sellWeakPositions(ns, quotes, fees);
         const targets = allocationTargets(ns, quotes);
-        realizedProfit += trimOverweight(ns, targets, fees);
-        buyUnderweight(ns, quotes, targets, fees);
+        const sales = [...weakSales, ...trimOverweight(ns, targets, fees)];
+        const purchases = buyUnderweight(ns, quotes, targets, fees);
+        realizedProfit += sales.reduce((total, sale) => total + sale.gain, 0);
+        announceTrades(ns, sales, purchases);
 
         if (++tick % SUMMARY_EVERY_TICKS === 0) printSummary(ns, realizedProfit);
 
@@ -134,34 +137,65 @@ function maxPositionValue(stock) {
 }
 
 /**
+ * One pop-up per kind of trade per tick, summing every stock traded in it, so the player sees each round at a glance.
+ * @param {NS} ns
+ * @param {Sale[]} sales
+ * @param {Purchase[]} purchases
+ */
+function announceTrades(ns, sales, purchases) {
+    if (sales.length > 0) {
+        const proceeds = sales.reduce((total, sale) => total + sale.proceeds, 0);
+        const gain = sales.reduce((total, sale) => total + sale.gain, 0);
+        ns.toast(`Sold ${stockCount(sales)} for $${ns.format.number(proceeds)} (P/L ${gain >= 0 ? "+" : "-"}$${ns.format.number(Math.abs(gain))})`, gain >= 0 ? "success" : "warning");
+    }
+
+    if (purchases.length > 0) {
+        const cost = purchases.reduce((total, purchase) => total + purchase.cost, 0);
+        ns.toast(`Bought ${stockCount(purchases)} for $${ns.format.number(cost)}`, "info");
+    }
+}
+
+/**
+ * @param {{ sym: string }[]} trades
+ * @returns {string} e.g. "3 stocks"
+ */
+function stockCount(trades) {
+    const symbols = new Set(trades.map(trade => trade.sym)).size;
+
+    return `${symbols} ${symbols === 1 ? "stock" : "stocks"}`;
+}
+
+/**
  * @param {NS} ns
  * @param {Quote[]} quotes
  * @param {Fees} fees
- * @returns {number} realized profit
+ * @returns {Sale[]}
  */
 function sellWeakPositions(ns, quotes, fees) {
     const weak = quotes.filter(stock => stock.owned > 0 && stock.forecast < SELL_FORECAST);
 
-    return weak.reduce((profit, stock) => profit + sell(ns, stock, stock.owned, fees, `forecast ${pct(stock.forecast)}`), 0);
+    return weak.map(stock => sell(ns, stock, stock.owned, fees, `forecast ${pct(stock.forecast)}`)).filter(sale => sale !== null);
 }
 
 /**
  * @param {NS} ns
  * @param {Target[]} targets
  * @param {Fees} fees
- * @returns {number} realized profit
+ * @returns {Sale[]}
  */
 function trimOverweight(ns, targets, fees) {
-    let profit = 0;
+    /** @type {Sale[]} */
+    const sales = [];
 
     for (const { stock, targetValue } of targets) {
         const excess = stock.owned * stock.bid - targetValue;
         if (excess < Math.max(fees.minTrade, targetValue * REBALANCE_BAND)) continue;
 
-        profit += sell(ns, stock, Math.floor(excess / stock.bid), fees, `over target ${ns.format.number(targetValue)}`);
+        const sale = sell(ns, stock, Math.floor(excess / stock.bid), fees, `over target ${ns.format.number(targetValue)}`);
+        if (sale !== null) sales.push(sale);
     }
 
-    return profit;
+    return sales;
 }
 
 /**
@@ -169,9 +203,12 @@ function trimOverweight(ns, targets, fees) {
  * @param {Quote[]} quotes
  * @param {Target[]} targets
  * @param {Fees} fees
+ * @returns {Purchase[]}
  */
 function buyUnderweight(ns, quotes, targets, fees) {
     let budget = Math.min(ns.getServerMoneyAvailable("home") - CASH_FLOOR, stockBudget(ns, quotes) - value(quotes));
+    /** @type {Purchase[]} */
+    const purchases = [];
 
     for (const { stock, targetValue } of targets) {
         const shortfall = targetValue - stock.owned * stock.ask;
@@ -188,8 +225,11 @@ function buyUnderweight(ns, quotes, targets, fees) {
 
         budget -= shares * price;
         stock.owned += shares;
+        purchases.push({ sym: stock.sym, cost: shares * price + fees.commission });
         ns.print(`BOUGHT ${ns.format.number(shares, 0)} ${stock.sym} @ ${ns.format.number(price)} (forecast ${pct(stock.forecast)}, target ${ns.format.number(targetValue)})`);
     }
+
+    return purchases;
 }
 
 /**
@@ -198,21 +238,21 @@ function buyUnderweight(ns, quotes, targets, fees) {
  * @param {number} shares
  * @param {Fees} fees
  * @param {string} reason
- * @returns {number} realized profit
+ * @returns {Sale | null} null when the sale failed (already reported)
  */
 function sell(ns, stock, shares, fees, reason) {
     const price = ns.stock.sellStock(stock.sym, shares);
     if (price === 0) {
         reportFailure(ns, `selling ${ns.format.number(shares, 0)} ${stock.sym} failed (${reason}); retrying next tick`);
 
-        return 0;
+        return null;
     }
 
     const gain = (price - stock.avgPrice) * shares - 2 * fees.commission;
     ns.print(`SOLD ${ns.format.number(shares, 0)} ${stock.sym} @ ${ns.format.number(price)} (${reason}, P/L ${ns.format.number(gain)})`);
     stock.owned -= shares;
 
-    return gain;
+    return { sym: stock.sym, proceeds: price * shares - fees.commission, gain };
 }
 
 /**

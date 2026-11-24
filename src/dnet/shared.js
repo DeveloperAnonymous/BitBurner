@@ -1,4 +1,4 @@
-export const CRAWLER_VERSION = 11;
+export const CRAWLER_VERSION = 14;
 export const REPORT_PORT = 7;
 export const VERSION_PORT = 8;
 export const STASIS_PORT = 9;

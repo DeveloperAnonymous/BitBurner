@@ -1,40 +1,48 @@
-import { emptyCount, parseBoard, searchBestMove, weakestBlackLiberties } from "/lib/go-engine.js";
+import { holdsAgainstEveryWhiteReply, parseBoard, searchBestMove } from "/lib/go-engine.js";
 import { reportFailure } from "/lib/report.js";
 
 /** @typedef {"No AI" | "Netburners" | "Slum Snakes" | "The Black Hand" | "Tetrads" | "Daedalus" | "Illuminati" | "????????????"} Opponent */
 /** @typedef {{ lineup: Opponent[], gamesEach: number, index: number, played: number }} Rotation */
-/** @typedef {{ type: "move" | "pass" | "gameOver" | "resign" }} TurnOutcome */
+/** @typedef {{ type: "move" | "pass" | "gameOver" | "resign", passedFirst?: boolean }} TurnOutcome */
+/** @typedef {{ whitePassed: boolean, passedFirst: boolean }} GameMemory what this script saw earlier in the current game */
 
 const OPPONENTS = ["Netburners", "Slum Snakes", "The Black Hand", "Tetrads", "Daedalus", "Illuminati", "????????????", "No AI"];
 const ROTATION_LINEUP = /** @type {Opponent[]} */ (OPPONENTS.filter(opponent => opponent !== "No AI" && opponent !== "????????????"));
 const GAMES_PER_OPPONENT = 5;
 const BOARD_SIZES = [5, 7, 9, 13];
-const DEFAULT_SIZE = 7;
+const DEFAULT_SIZE = /** @type {5 | 7 | 9 | 13} */ (7);
 const RETRY_MS = 5000;
 
-const SEARCH_MS_PER_POINT = 30;
+const SEARCH_MS_PER_POINT = 5;
+/** @type {Partial<Record<Opponent, number>>} extra thinking time for the factions the bot loses to most */
+const THINKING_MULTIPLIER = { "Illuminati": 10, "Tetrads": 4, "Daedalus": 2 };
 const RESIGN_WIN_RATE = 0.03;
 const MIN_PLAYOUTS_TO_RESIGN = 2000;
-const SAFE_LIBERTIES = 3;
 
 /**
  * Plays IPvGO as black forever, choosing moves with Monte Carlo Tree Search (/lib/go-engine.js).
- * - No args: 7x7 games, GAMES_PER_OPPONENT against each faction in turn, looping. A faction that refuses a game
- *   (for example one not unlocked yet) is skipped.
- * - run /ipvgo.js <opponent> [boardSize]: only that opponent, on boardSize (default 7).
+ * run /ipvgo.js [size] [opponent...]
+ * - size: 5, 7, 9 or 13 (default 7).
+ * - opponents: every argument after the size, any case; commas also separate names. Quote names with spaces, e.g.
+ *   run /ipvgo.js 9 "Slum Snakes" Illuminati. Default: every faction except "No AI" and "????????????".
+ * Plays GAMES_PER_OPPONENT games against each opponent in turn, looping. An opponent the game refuses (for example
+ * one not unlocked yet) is dropped.
  * @param {NS} ns
  */
 export async function main(ns) {
     ns.disableLog("ALL");
 
-    const rotation = rotationFromArgs(ns);
-    if (rotation === null) return;
+    const plan = planFromArgs(ns);
+    if (plan === null) return;
 
-    const size = /** @type {5 | 7 | 9 | 13} */ (Number(ns.args[1] ?? DEFAULT_SIZE));
-    const record = { wins: 0, losses: 0 };
-    ns.print(`Playing ${rotation.lineup.join(", ")} on ${size}x${size}${rotation.lineup.length > 1 ? `, ${rotation.gamesEach} games each` : ""}`);
+    const { rotation, size } = plan;
+    /** @type {Map<string, { wins: number, losses: number }>} */
+    const records = new Map();
+    ns.print(`Playing ${rotation.lineup.join(", ")} on ${size}x${size}, ${rotation.gamesEach} games each`);
 
     let resigned = false;
+    /** @type {GameMemory} */
+    let memory = { whitePassed: false, passedFirst: false };
 
     while (rotation.lineup.length > 0) {
         const needsGame = resigned || ns.go.getCurrentPlayer() === "None";
@@ -43,11 +51,13 @@ export async function main(ns) {
             continue;
         }
 
+        if (needsGame) memory = { whitePassed: false, passedFirst: false };
         resigned = false;
-        const outcome = await takeTurn(ns);
+        const outcome = await takeTurn(ns, memory);
+        memory = { whitePassed: outcome.type === "pass", passedFirst: memory.passedFirst || outcome.passedFirst === true };
         if (outcome.type === "move" || outcome.type === "pass") continue;
 
-        logResult(ns, record, outcome.type);
+        logResult(ns, records, outcome.type);
         rotation.played++;
         if (rotation.played >= rotation.gamesEach) advance(rotation);
         resigned = outcome.type === "resign";
@@ -57,21 +67,43 @@ export async function main(ns) {
 }
 
 /**
+ * Bad args are printed to the terminal, since the player is looking there right after typing the command.
  * @param {NS} ns
- * @returns {Rotation | null} null after reporting bad args
+ * @returns {{ rotation: Rotation, size: 5 | 7 | 9 | 13 } | null} null after reporting bad args
  */
-function rotationFromArgs(ns) {
-    if (ns.args.length === 0) return { lineup: [...ROTATION_LINEUP], gamesEach: GAMES_PER_OPPONENT, index: 0, played: 0 };
+function planFromArgs(ns) {
+    const [sizeArg, ...opponentArgs] = ns.args;
+    const size = sizeArg === undefined ? DEFAULT_SIZE : sizeArg;
+    const names = opponentArgs.flatMap(arg => String(arg).split(",")).map(name => name.trim()).filter(name => name !== "");
+    const lineup = names.length === 0 ? [...ROTATION_LINEUP] : names.map(canonicalOpponent);
+    const unknown = names.filter((_, index) => lineup[index] === null);
 
-    const opponent = String(ns.args[0]);
-    const size = Number(ns.args[1] ?? DEFAULT_SIZE);
-    if (OPPONENTS.includes(opponent) && BOARD_SIZES.includes(size)) {
-        return { lineup: [/** @type {Opponent} */ (opponent)], gamesEach: Infinity, index: 0, played: 0 };
+    if (isBoardSize(size) && unknown.length === 0) {
+        return { rotation: { lineup: /** @type {Opponent[]} */ (lineup), gamesEach: GAMES_PER_OPPONENT, index: 0, played: 0 }, size };
     }
 
-    reportFailure(ns, `ipvgo.js takes no args, or <opponent> [size]: opponent one of ${OPPONENTS.join(", ")}; size one of ${BOARD_SIZES.join(", ")}. Got ${JSON.stringify(ns.args)}`);
+    const problem = isBoardSize(size) ? `unknown opponent ${unknown.map(name => `"${name}"`).join(", ")}` : `size must be one of ${BOARD_SIZES.join(", ")}, got ${JSON.stringify(sizeArg)}`;
+    ns.tprint(`ipvgo.js: ${problem}. Usage: run /ipvgo.js [size] [opponent...]. Opponents: ${OPPONENTS.join(", ")}`);
 
     return null;
+}
+
+/**
+ * @param {string} name any case
+ * @returns {Opponent | null}
+ */
+function canonicalOpponent(name) {
+    const match = OPPONENTS.find(opponent => opponent.toLowerCase() === name.toLowerCase());
+
+    return match === undefined ? null : /** @type {Opponent} */ (match);
+}
+
+/**
+ * @param {unknown} value
+ * @returns {value is 5 | 7 | 9 | 13}
+ */
+function isBoardSize(value) {
+    return typeof value === "number" && BOARD_SIZES.includes(value);
 }
 
 /** @param {Rotation} rotation */
@@ -119,22 +151,25 @@ function resetRefusal(ns, opponent, size) {
  * Waits for white when it is white's turn (e.g. the script restarted mid-game). Otherwise passes a decided game,
  * resigns a lost one, or plays the searched move.
  * @param {NS} ns
+ * @param {GameMemory} memory whitePassed: white's last reply to this script was a pass (previousMove covers a game the
+ *   script picked up mid-way, before it saw any reply)
  * @returns {Promise<TurnOutcome>}
  */
-async function takeTurn(ns) {
+async function takeTurn(ns, memory) {
     if (ns.go.getCurrentPlayer() === "White") return ns.go.opponentNextTurn();
 
     const state = ns.go.getGameState();
     const lead = state.blackScore - state.whiteScore;
     const history = ns.go.getMoveHistory();
     const position = parseBoard(ns.go.getBoardState());
-    const whiteJustPassed = state.previousMove === null && history.length > 0;
-    if ((whiteJustPassed && lead > 0) || isDecided(position, lead)) return ns.go.passTurn();
+    const whiteJustPassed = memory.whitePassed || (state.previousMove === null && history.length > 0);
+    if (whiteJustPassed && lead > 0) return ns.go.passTurn();
+    if (isSafeToPassFirst(position, state, memory)) return passFirst(ns, lead);
 
     const result = await searchBestMove(position, {
         komi: state.komi,
         seenKeys: new Set(history.map(board => board.join(""))),
-        timeMs: position.cells.length * SEARCH_MS_PER_POINT,
+        timeMs: position.cells.length * SEARCH_MS_PER_POINT * (THINKING_MULTIPLIER[ns.go.getOpponent()] ?? 1),
         pause: () => ns.sleep(0),
     });
     if (result === null) return ns.go.passTurn();
@@ -144,11 +179,37 @@ async function takeTurn(ns) {
 }
 
 /**
+ * Passing first is safe when black leads on the official score and no single white move can catch up. It is done at
+ * most once per game: if white plays on instead, several white moves in a row could add up, so the bot fights on and
+ * the game ends whenever white passes.
+ * @param {import("/lib/go-engine.js").Position} position
+ * @param {{ blackScore: number, whiteScore: number, komi: number }} state
+ * @param {GameMemory} memory
+ */
+function isSafeToPassFirst(position, state, memory) {
+    if (memory.passedFirst || state.blackScore <= state.whiteScore) return false;
+
+    return holdsAgainstEveryWhiteReply(position, state.komi);
+}
+
+/**
+ * Passes before white has, because the game is already won; white's next pass ends it.
+ * @param {NS} ns
+ * @param {number} lead
+ * @returns {Promise<TurnOutcome>}
+ */
+async function passFirst(ns, lead) {
+    ns.print(`  game won, passing to end (ahead by ${lead.toFixed(1)})`);
+
+    return { ...(await ns.go.passTurn()), passedFirst: true };
+}
+
+/**
  * @param {NS} ns
  * @param {import("/lib/go-engine.js").SearchResult} result
  */
 async function playMove(ns, result) {
-    ns.print(`  ${result.x},${result.y}: ${(result.winRate * 100).toFixed(0)}% win over ${result.playouts} playouts`);
+    ns.print(`  ${(result.winRate * 100).toFixed(0)}% win chance`);
 
     try {
         return await ns.go.makeMove(result.x, result.y);
@@ -160,26 +221,20 @@ async function playMove(ns, result) {
 }
 
 /**
- * Black leads by more than every empty point is worth and no black chain is short of liberties, so passing until
- * white passes too cannot lose.
- * @param {import("/lib/go-engine.js").Position} position
- * @param {number} lead
- */
-function isDecided(position, lead) {
-    return lead > emptyCount(position) && weakestBlackLiberties(position) >= SAFE_LIBERTIES;
-}
-
-/**
+ * Logs the game and the running win/loss tally against that opponent since the script started.
  * @param {NS} ns
- * @param {{ wins: number, losses: number }} record
+ * @param {Map<string, { wins: number, losses: number }>} records by opponent
  * @param {"gameOver" | "resign"} ending
  */
-function logResult(ns, record, ending) {
+function logResult(ns, records, ending) {
     const state = ns.go.getGameState();
+    const opponent = ns.go.getOpponent();
     const won = ending === "gameOver" && state.blackScore > state.whiteScore;
+    const record = records.get(opponent) ?? { wins: 0, losses: 0 };
     if (won) record.wins++;
     else record.losses++;
 
+    records.set(opponent, record);
     const verdict = won ? "WON" : ending === "resign" ? "RESIGNED" : "LOST";
-    ns.print(`${verdict} ${state.blackScore} to ${state.whiteScore} against ${ns.go.getOpponent()} | ${record.wins}W ${record.losses}L`);
+    ns.print(`${verdict} ${state.blackScore} to ${state.whiteScore} against ${opponent} | ${record.wins}W ${record.losses}L`);
 }

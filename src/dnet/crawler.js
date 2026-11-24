@@ -61,7 +61,7 @@ function isOutdated(ns) {
  */
 function openCaches(ns, here) {
     for (const cache of ns.ls(here, ".cache")) {
-        const result = ns.dnet.openCache(cache);
+        const result = ns.dnet.openCache(cache, true);
         report(ns, "cache", `${cache}: ${result.message}`);
     }
 }

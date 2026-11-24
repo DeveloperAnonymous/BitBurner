@@ -3,10 +3,10 @@ import { reportFailure } from "/lib/report.js";
 
 const ENTRY = "darkweb";
 const HOSTS_FILE = "dnet/hosts.txt";
-const LOOT_FILE = "dnet/loot.txt";
 const STASIS_RECHECK_MS = 60000;
-/** @type {Set<import("/dnet/shared.js").ReportKind>} */
-const LOGGED_KINDS = new Set(["cache", "loot", "stasis"]);
+const STORM_SEED = "STORM_SEED.exe";
+/** @type {Partial<Record<import("/dnet/shared.js").ReportKind, string>>} where each kind of report is kept on home */
+const LOG_FILES = { cache: "dnet/loot.txt", loot: "dnet/loot.txt", stasis: "dnet/loot.txt", failed: "dnet/failed.txt" };
 const EMPTY_PORT = "NULL PORT DATA";
 /** @type {Record<string, number>} */
 const MONEY_SUFFIXES = { "": 1, k: 1e3, m: 1e6, b: 1e9, t: 1e12, q: 1e15 };
@@ -41,7 +41,8 @@ export async function main(ns) {
             const text = report.kind === "loot" ? claimReward(ns, report.host, report.text) : report.text;
             const line = `[${report.kind} #${counts[report.kind]}] ${report.host}: ${text}`;
             ns.print(line);
-            if (LOGGED_KINDS.has(report.kind)) ns.write(LOOT_FILE, `${new Date().toLocaleString()} ${line}\n`, "a");
+            const logFile = LOG_FILES[report.kind];
+            if (logFile !== undefined) ns.write(logFile, `${new Date().toLocaleString()} ${line}\n`, "a");
             ns.print(`  totals: ${counts.cache} caches, ${counts.loot} rewards, ${counts.phish} phishes, ${counts.cracked} cracked, ${counts.failed} unsolved | ${incomeTitle(ns, moneyMentioned, startedAt)}`);
         }
 
@@ -113,7 +114,8 @@ function postStasisTarget(ns, knownHosts, previous) {
 }
 
 /**
- * Nodes that can take a stasis link, most complex first (difficulty, then depth). Each needs room for stasis.js once
+ * Nodes that can take a stasis link, deepest first (then most difficult), since a pinned deep node keeps the crawl's
+ * furthest foothold from drifting away. Each needs room for stasis.js once
  * its own scripts are cleared.
  * @param {NS} ns
  * @param {Set<string>} knownHosts
@@ -127,7 +129,7 @@ function stasisCandidates(ns, knownHosts, linked) {
         .filter(host => !linked.includes(host) && ns.serverExists(host))
         .map(host => ({ host, details: ns.dnet.getServerDetails(host) }))
         .filter(({ host, details }) => details.isOnline && !details.isStationary && ns.getServerMaxRam(host) - details.blockedRam >= neededRam)
-        .sort((a, b) => b.details.difficulty - a.details.difficulty || b.details.depth - a.details.depth)
+        .sort((a, b) => b.details.depth - a.details.depth || b.details.difficulty - a.details.difficulty)
         .map(({ host }) => host);
 }
 
@@ -140,17 +142,9 @@ function stasisCandidates(ns, knownHosts, linked) {
  * @returns {string} what happened, for the log
  */
 function claimReward(ns, host, file) {
-    if (file.endsWith(".cct")) {
-        ns.toast(`Darknet contract ${file} on ${host}`, "info");
-
-        return `contract ${file} (contracts.js solves it)`;
-    }
-
-    if (file.endsWith(".exe")) {
-        ns.toast(`Darknet program ${file} on ${host}: fetch it by hand`, "warning", 30000);
-
-        return `PROGRAM ${file}: scripts cannot copy programs, fetch it by hand`;
-    }
+    if (file.endsWith(".cct")) return `contract ${file} (contracts.js solves it)`;
+    if (file === STORM_SEED) return `${STORM_SEED} left alone: running it unleashes a webstorm that damages the darknet`;
+    if (file.endsWith(".exe")) return `PROGRAM ${file}: scripts cannot copy programs, fetch it by hand`;
 
     if (ns.fileExists(file, "home")) return `${file} (already on home)`;
 

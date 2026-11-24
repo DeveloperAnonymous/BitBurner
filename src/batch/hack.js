@@ -2,7 +2,7 @@
 export async function main(ns) {
     const [target, additionalMsec] = ns.args;
     if (typeof target !== "string" || typeof additionalMsec !== "number") {
-        ns.toast(`batch/hack.js needs (target, delayMs, tag), got ${JSON.stringify(ns.args)}`, "error", 15000);
+        ns.tprint(`batch/hack.js needs (target, delayMs, tag), got ${JSON.stringify(ns.args)}`);
 
         return;
     }

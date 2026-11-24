@@ -73,7 +73,6 @@ function solveContract(ns, { host, file, type, solve }) {
     const reward = ns.codingcontract.attempt(answer, file, host);
     if (reward === "") {
         ns.print(`FAILED ${type} on ${host}: data ${JSON.stringify(data)} answer ${JSON.stringify(answer)}`);
-        ns.toast(`Contract failed: ${type}`, "error");
 
         return;
     }
