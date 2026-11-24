@@ -1,4 +1,4 @@
-import { CRACKER_FILE as CRACKER, CRAWLER_FILE as CRAWLER, CRAWLER_VERSION as VERSION, LEGACY_WORM_FILE as LEGACY_WORM, PHISH_FILE as PHISH, VERSION_PORT, report } from "/dnet/shared.js";
+import { CRACKER_FILE as CRACKER, CRAWLER_FILE as CRAWLER, CRAWLER_VERSION as VERSION, LEGACY_WORM_FILE as LEGACY_WORM, PHISH_FILE as PHISH, STASIS_PORT, VERSION_PORT, report } from "/dnet/shared.js";
 
 const LOOP_MS = 2000;
 const RETRY_MS = 5 * 60 * 1000;
@@ -8,6 +8,7 @@ const reportedRewards = new Set();
 
 /**
  * @typedef {{ attempts: number, retryAt: number }} CrackRecord
+ * @typedef {{ host: string, goal: import("/dnet/shared.js").CrackGoal }} CrackJob
  */
 
 /**
@@ -29,8 +30,12 @@ export async function main(ns) {
         reportRewards(ns, here);
 
         const cracking = crackersRunning(ns, here);
-        const uncrawled = ns.dnet.probe().filter(host => needsCrawler(ns, host) && !cracking.has(host));
-        for (const host of uncrawled) startCracker(ns, here, host, crackRecords);
+        const neighbors = ns.dnet.probe().filter(host => !cracking.has(host));
+        const jobs = neighbors.filter(host => needsCrawler(ns, host)).map(host => ({ host, goal: /** @type {const} */ ("crawl") }));
+        const stasisTarget = ns.peek(STASIS_PORT);
+        if (awaitsStasis(ns, neighbors, stasisTarget)) jobs.push({ host: stasisTarget, goal: "stasis" });
+
+        for (const job of jobs) startCracker(ns, here, job, crackRecords);
 
         startPhishing(ns, here);
         await freeOwnBlockedRam(ns, here);
@@ -56,7 +61,7 @@ function isOutdated(ns) {
  */
 function openCaches(ns, here) {
     for (const cache of ns.ls(here, ".cache")) {
-        const result = ns.dnet.openCache(cache, true);
+        const result = ns.dnet.openCache(cache);
         report(ns, "cache", `${cache}: ${result.message}`);
     }
 }
@@ -96,36 +101,51 @@ function needsCrawler(ns, host) {
 }
 
 /**
- * Starts a cracker for the host unless its last failed try is still cooling down.
+ * The node dnet/start.js picked for a stasis link, once it is a neighbor that already runs the current crawler (so the
+ * crawl job and the stasis job never race) and is not linked yet.
+ * @param {NS} ns
+ * @param {string[]} neighbors
+ * @param {unknown} stasisTarget
+ * @returns {stasisTarget is string}
+ */
+function awaitsStasis(ns, neighbors, stasisTarget) {
+    if (typeof stasisTarget !== "string" || !neighbors.includes(stasisTarget)) return false;
+
+    return ns.isRunning(CRAWLER, stasisTarget, VERSION) && !ns.dnet.getStasisLinkedServers().includes(stasisTarget);
+}
+
+/**
+ * Starts a cracker for the job unless its last failed try is still cooling down.
  * @param {NS} ns
  * @param {string} here
- * @param {string} host
+ * @param {CrackJob} job
  * @param {Map<string, CrackRecord>} crackRecords
  */
-function startCracker(ns, here, host, crackRecords) {
-    const record = crackRecords.get(host) ?? { attempts: 0, retryAt: 0 };
+function startCracker(ns, here, job, crackRecords) {
+    const key = `${job.goal}:${job.host}`;
+    const record = crackRecords.get(key) ?? { attempts: 0, retryAt: 0 };
     if (Date.now() < record.retryAt) return;
 
     const tryNumber = record.attempts + 1;
-    if (!execCracker(ns, here, host, tryNumber)) return;
+    if (!execCracker(ns, here, job, tryNumber)) return;
 
-    crackRecords.set(host, { attempts: tryNumber, retryAt: Date.now() + RETRY_MS });
+    crackRecords.set(key, { attempts: tryNumber, retryAt: Date.now() + RETRY_MS });
 }
 
 /**
  * Stops phishing when that is what keeps the cracker from fitting.
  * @param {NS} ns
  * @param {string} here
- * @param {string} host
+ * @param {CrackJob} job
  * @param {number} tryNumber
  * @returns {boolean} whether the cracker started
  */
-function execCracker(ns, here, host, tryNumber) {
-    if (ns.exec(CRACKER, here, 1, host, tryNumber) !== 0) return true;
+function execCracker(ns, here, { host, goal }, tryNumber) {
+    if (ns.exec(CRACKER, here, 1, host, goal, tryNumber) !== 0) return true;
 
     if (ns.isRunning(PHISH, here)) {
         ns.scriptKill(PHISH, here);
-        if (ns.exec(CRACKER, here, 1, host, tryNumber) !== 0) return true;
+        if (ns.exec(CRACKER, here, 1, host, goal, tryNumber) !== 0) return true;
     }
 
     reportOnce(ns, `cracker:${host}`, `no RAM to crack ${host} (free ${ns.getServerMaxRam(here) - ns.getServerUsedRam(here)} GB, cracker needs ${ns.getScriptRam(CRACKER)} GB)`);

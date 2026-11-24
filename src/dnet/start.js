@@ -1,8 +1,12 @@
-import { CRACKER_FILE, CRAWLER_FILE as CRAWLER, CRAWLER_FILES as FILES, CRAWLER_VERSION, LEGACY_WORM_FILE, PHISH_FILE as PHISH, REPORT_PORT, VERSION_PORT } from "/dnet/shared.js";
+import { CRACKER_FILE, CRAWLER_FILE as CRAWLER, CRAWLER_FILES as FILES, CRAWLER_VERSION, LEGACY_WORM_FILE, PHISH_FILE as PHISH, REPORT_PORT, STASIS_FILE, STASIS_PORT, VERSION_PORT } from "/dnet/shared.js";
 import { reportFailure } from "/lib/report.js";
 
 const ENTRY = "darkweb";
 const HOSTS_FILE = "dnet/hosts.txt";
+const LOOT_FILE = "dnet/loot.txt";
+const STASIS_RECHECK_MS = 60000;
+/** @type {Set<import("/dnet/shared.js").ReportKind>} */
+const LOGGED_KINDS = new Set(["cache", "loot", "stasis"]);
 const EMPTY_PORT = "NULL PORT DATA";
 /** @type {Record<string, number>} */
 const MONEY_SUFFIXES = { "": 1, k: 1e3, m: 1e6, b: 1e9, t: 1e12, q: 1e15 };
@@ -15,12 +19,19 @@ export async function main(ns) {
     if (!launchCrawler(ns)) return;
 
     /** @type {Record<import("/dnet/shared.js").ReportKind, number>} */
-    const counts = { cache: 0, cracked: 0, failed: 0, phish: 0, loot: 0 };
+    const counts = { cache: 0, cracked: 0, failed: 0, phish: 0, loot: 0, stasis: 0 };
     const startedAt = Date.now();
     let moneyMentioned = 0;
+    let stasisTarget = postStasisTarget(ns, knownHosts, null);
+    let stasisCheckedAt = Date.now();
     ns.ui.setTailTitle(incomeTitle(ns, moneyMentioned, startedAt));
 
     while (true) {
+        if (Date.now() - stasisCheckedAt >= STASIS_RECHECK_MS) {
+            stasisTarget = postStasisTarget(ns, knownHosts, stasisTarget);
+            stasisCheckedAt = Date.now();
+        }
+
         for (let entry = ns.readPort(REPORT_PORT); entry !== EMPTY_PORT; entry = ns.readPort(REPORT_PORT)) {
             /** @type {{ host: string, kind: import("/dnet/shared.js").ReportKind, text: string }} */
             const report = entry;
@@ -28,7 +39,9 @@ export async function main(ns) {
             counts[report.kind]++;
             moneyMentioned += moneyIn(report.text);
             const text = report.kind === "loot" ? claimReward(ns, report.host, report.text) : report.text;
-            ns.print(`[${report.kind} #${counts[report.kind]}] ${report.host}: ${text}`);
+            const line = `[${report.kind} #${counts[report.kind]}] ${report.host}: ${text}`;
+            ns.print(line);
+            if (LOGGED_KINDS.has(report.kind)) ns.write(LOOT_FILE, `${new Date().toLocaleString()} ${line}\n`, "a");
             ns.print(`  totals: ${counts.cache} caches, ${counts.loot} rewards, ${counts.phish} phishes, ${counts.cracked} cracked, ${counts.failed} unsolved | ${incomeTitle(ns, moneyMentioned, startedAt)}`);
         }
 
@@ -77,6 +90,45 @@ function cleanupDarknet(ns) {
     ns.print(`Cleared darknet scripts on ${present.length} nodes`);
 
     return new Set(present);
+}
+
+/**
+ * Posts the node crawlers should stasis-link while links are free, or clears the port when none are.
+ * Keeps the previous target while it still qualifies, so crawlers do not chase a moving pick.
+ * @param {NS} ns
+ * @param {Set<string>} knownHosts
+ * @param {string | null} previous
+ * @returns {string | null} the posted target
+ */
+function postStasisTarget(ns, knownHosts, previous) {
+    const linked = ns.dnet.getStasisLinkedServers();
+    const candidates = linked.length < ns.dnet.getStasisLinkLimit() ? stasisCandidates(ns, knownHosts, linked) : [];
+    const target = previous !== null && candidates.includes(previous) ? previous : (candidates[0] ?? null);
+
+    ns.clearPort(STASIS_PORT);
+    if (target !== null) ns.writePort(STASIS_PORT, target);
+    if (target !== previous) ns.print(target === null ? `Stasis links: ${linked.length}/${ns.dnet.getStasisLinkLimit()} used (${linked.join(", ") || "none"})` : `Stasis link target: ${target}`);
+
+    return target;
+}
+
+/**
+ * Nodes that can take a stasis link, most complex first (difficulty, then depth). Each needs room for stasis.js once
+ * its own scripts are cleared.
+ * @param {NS} ns
+ * @param {Set<string>} knownHosts
+ * @param {string[]} linked
+ * @returns {string[]}
+ */
+function stasisCandidates(ns, knownHosts, linked) {
+    const neededRam = ns.getScriptRam(STASIS_FILE, "home");
+
+    return [...knownHosts]
+        .filter(host => !linked.includes(host) && ns.serverExists(host))
+        .map(host => ({ host, details: ns.dnet.getServerDetails(host) }))
+        .filter(({ host, details }) => details.isOnline && !details.isStationary && ns.getServerMaxRam(host) - details.blockedRam >= neededRam)
+        .sort((a, b) => b.details.difficulty - a.details.difficulty || b.details.depth - a.details.depth)
+        .map(({ host }) => host);
 }
 
 /**
