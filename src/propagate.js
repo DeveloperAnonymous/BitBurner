@@ -17,6 +17,8 @@ const SECURITY_TOLERANCE = 0.05;
 const MONEY_TOLERANCE = 0.99;
 const MIN_MONEY_FOR_GROWTH = 1;
 const MAX_STOLEN_FRACTION = 0.9;
+const HOME_RESERVE_FRACTION = 0.25;
+const HOME_MIN_RESERVE_GB = 64;
 
 // Fixed game values, hardcoded because the analyze functions that return them cost 1 GB each.
 const HACK_SECURITY_PER_THREAD = 0.002;
@@ -98,7 +100,7 @@ function releaseFinishedTargets(ns, busyTargets) {
  * @param {Map<string, number>} pool
  */
 function printStatus(ns, busyTargets, hosts, pool) {
-    const totalRam = hosts.reduce((total, host) => total + ns.getServerMaxRam(host), 0);
+    const totalRam = hosts.reduce((total, host) => total + usableRam(ns, host), 0);
     ns.print(`Working ${busyTargets.size} targets (${[...busyTargets.keys()].join(", ")}) | RAM ${ns.format.ram(totalRam - totalFreeRam(pool))} of ${ns.format.ram(totalRam)} used`);
 }
 
@@ -179,7 +181,6 @@ function rootAll(ns, servers) {
  */
 function workerHosts(ns, servers) {
     return servers.filter(server =>
-        server !== "home" &&
         !server.startsWith("hacknet-") &&
         ns.hasRootAccess(server) &&
         ns.getServerMaxRam(server) > 0
@@ -193,6 +194,7 @@ function workerHosts(ns, servers) {
  */
 function copyBatchScripts(ns, hosts) {
     return hosts.filter(host => {
+        if (host === "home") return true;
         if (ns.scp(BATCH_SCRIPTS, host, "home")) return true;
 
         reportFailure(ns, `scp of batch scripts to ${host} failed; skipping it this pass`);
@@ -452,7 +454,7 @@ function prepJobs(ns, target, capacity, timing, prepRam) {
 }
 
 /**
- * Free RAM minus the part of each host's share reserve that share threads have not claimed yet.
+ * Free RAM minus the home reserve and the part of each host's share reserve that share threads have not claimed yet.
  * @param {NS} ns
  * @param {string[]} hosts
  * @param {number} shareThreadRam
@@ -463,8 +465,20 @@ function freeRamByHost(ns, hosts, shareThreadRam) {
         const maxRam = ns.getServerMaxRam(host);
         const unclaimedReserve = Math.max(0, shareReserve(host, maxRam) - shareThreads(ns, host) * shareThreadRam);
 
-        return [host, Math.max(0, maxRam - ns.getServerUsedRam(host) - unclaimedReserve)];
+        return [host, Math.max(0, usableRam(ns, host) - ns.getServerUsedRam(host) - unclaimedReserve)];
     }));
+}
+
+/**
+ * Max RAM minus the space kept free on home for other scripts.
+ * @param {NS} ns
+ * @param {string} host
+ */
+function usableRam(ns, host) {
+    const maxRam = ns.getServerMaxRam(host);
+    if (host !== "home") return maxRam;
+
+    return Math.max(0, maxRam - Math.max(HOME_MIN_RESERVE_GB, maxRam * HOME_RESERVE_FRACTION));
 }
 
 /**
