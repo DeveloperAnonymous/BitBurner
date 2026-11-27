@@ -1,5 +1,5 @@
 import { reportFailure } from "/lib/report.js";
-import { SHARE_SCRIPT, shareReserve, shareThreads } from "/lib/share-reserve.js";
+import { SHARE_MANAGER_SCRIPT, SHARE_SCRIPT, shareReserve, shareThreads } from "/lib/share-reserve.js";
 
 const HACK_SCRIPT = "/batch/hack.js";
 const GROW_SCRIPT = "/batch/grow.js";
@@ -455,14 +455,17 @@ function prepJobs(ns, target, capacity, timing, prepRam) {
 
 /**
  * Free RAM minus the home reserve and the part of each host's share reserve that share threads have not claimed yet.
+ * Share reserves only apply while share-manager.js runs, so no RAM sits idle waiting for it.
  * @param {NS} ns
  * @param {string[]} hosts
  * @param {number} shareThreadRam
  * @returns {Map<string, number>}
  */
 function freeRamByHost(ns, hosts, shareThreadRam) {
+    const isSharing = ns.isRunning(SHARE_MANAGER_SCRIPT, "home");
+
     return new Map(hosts.map(host => {
-        const reserve = shareReserve(host, ns.getServerMaxRam(host));
+        const reserve = isSharing ? shareReserve(host, ns.getServerMaxRam(host)) : 0;
         const unclaimedReserve = reserve > 0 ? Math.max(0, reserve - shareThreads(ns, host) * shareThreadRam) : 0;
 
         return [host, Math.max(0, usableRam(ns, host) - ns.getServerUsedRam(host) - unclaimedReserve)];

@@ -1,6 +1,6 @@
 import { reportFailure } from "/lib/report.js";
 
-const BUY_FORECAST = 0.55;
+const BUY_FORECAST = 0.5;
 const SELL_FORECAST = 0.5;
 const INVEST_FRACTION = 0.95;
 const CONCENTRATION_POWER = 2;

@@ -9,7 +9,7 @@ const FORMULAS_PROGRAM = "Formulas.exe";
 
 /**
  * @typedef {{ level: number, ram: number, cores: number }} NodeShape
- * @typedef {{ label: string, cost: number, gain: number, buy: () => boolean }} Purchase
+ * @typedef {{ label: string, cost: number, gain: number, needsPayback: boolean, buy: () => boolean }} Purchase
  */
 
 /** @param {NS} ns */
@@ -29,8 +29,8 @@ export async function main(ns) {
 
     while (true) {
         const best = bestPurchase(ns);
-        if (best === null || best.cost / best.gain > MAX_PAYBACK_SECONDS) {
-            ns.print(`Nothing pays back within ${ns.format.time(MAX_PAYBACK_SECONDS * 1000)}. Waiting.`);
+        if (best === null) {
+            ns.print(`No new node available and no upgrade pays back within ${ns.format.time(MAX_PAYBACK_SECONDS * 1000)}. Waiting.`);
             await ns.sleep(IDLE_WAIT_MS);
             continue;
         }
@@ -65,7 +65,7 @@ function bestPurchase(ns) {
     }
 
     return candidates
-        .filter(candidate => Number.isFinite(candidate.cost))
+        .filter(candidate => Number.isFinite(candidate.cost) && (!candidate.needsPayback || paysBackInTime(candidate)))
         .reduce((best, candidate) => (best === null || isBetterValue(candidate, best) ? candidate : best), /** @type {Purchase | null} */ (null));
 }
 
@@ -87,8 +87,14 @@ function newNode(ns, target) {
         label: `node #${ns.hacknet.numNodes()} (to grow to level ${target.level}, ${target.ram}GB, ${target.cores} cores)`,
         cost: ns.hacknet.getPurchaseNodeCost() + upgradeCost,
         gain: production(ns, target),
+        needsPayback: false,
         buy: () => ns.hacknet.purchaseNode() !== -1,
     };
+}
+
+/** @param {Purchase} candidate */
+function paysBackInTime(candidate) {
+    return candidate.cost / candidate.gain <= MAX_PAYBACK_SECONDS;
 }
 
 /**
@@ -106,18 +112,21 @@ function nodeUpgrades(ns, shape, index) {
             label: `level on node #${index}`,
             cost: ns.hacknet.getLevelUpgradeCost(index, 1),
             gain: gainFrom({ ...shape, level: shape.level + 1 }),
+            needsPayback: true,
             buy: () => ns.hacknet.upgradeLevel(index, 1),
         },
         {
             label: `RAM on node #${index}`,
             cost: ns.hacknet.getRamUpgradeCost(index, 1),
             gain: gainFrom({ ...shape, ram: shape.ram * 2 }),
+            needsPayback: true,
             buy: () => ns.hacknet.upgradeRam(index, 1),
         },
         {
             label: `core on node #${index}`,
             cost: ns.hacknet.getCoreUpgradeCost(index, 1),
             gain: gainFrom({ ...shape, cores: shape.cores + 1 }),
+            needsPayback: true,
             buy: () => ns.hacknet.upgradeCore(index, 1),
         },
     ];

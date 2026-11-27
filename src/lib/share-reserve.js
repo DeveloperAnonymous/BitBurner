@@ -1,4 +1,5 @@
 export const SHARE_SCRIPT = "/share.js";
+export const SHARE_MANAGER_SCRIPT = "/share-manager.js";
 export const CLOUD_SHARE_FRACTION = 0.5;
 export const WORLD_SHARE_FRACTION = 0.5;
 const CLOUD_PREFIX = "cloud-";
