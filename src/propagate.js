@@ -89,7 +89,7 @@ export async function main(ns) {
  */
 function releaseFinishedTargets(ns, busyTargets) {
     for (const [target, pids] of [...busyTargets]) {
-        if (!pids.some(pid => ns.isRunning(pid))) busyTargets.delete(target);
+        if (pids.findLastIndex(pid => ns.isRunning(pid)) === -1) busyTargets.delete(target);
     }
 }
 
@@ -462,8 +462,8 @@ function prepJobs(ns, target, capacity, timing, prepRam) {
  */
 function freeRamByHost(ns, hosts, shareThreadRam) {
     return new Map(hosts.map(host => {
-        const maxRam = ns.getServerMaxRam(host);
-        const unclaimedReserve = Math.max(0, shareReserve(host, maxRam) - shareThreads(ns, host) * shareThreadRam);
+        const reserve = shareReserve(host, ns.getServerMaxRam(host));
+        const unclaimedReserve = reserve > 0 ? Math.max(0, reserve - shareThreads(ns, host) * shareThreadRam) : 0;
 
         return [host, Math.max(0, usableRam(ns, host) - ns.getServerUsedRam(host) - unclaimedReserve)];
     }));

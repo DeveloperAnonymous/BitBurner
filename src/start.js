@@ -11,6 +11,7 @@ const SERVICES = [
     { script: "buy-servers.js", why: "buys and upgrades cloud servers", missing: () => null },
     { script: "share-manager.js", why: "fills half of each cloud server with share.js", missing: ns => missingFiles(ns, ["share.js"]) },
     { script: "stock.js", why: "trades stocks on 4S forecasts", missing: missingStockAccess },
+    { script: "ipvgo.js", why: "plays IPvGO against the faction rotation", missing: () => null },
     { script: "dnet/start.js", why: "runs the darknet crawler and logs its loot", missing: ns => missingFiles(ns, ["DarkscapeNavigator.exe"]) },
 ];
 

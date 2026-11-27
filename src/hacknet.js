@@ -5,6 +5,7 @@ const SPEND_FRACTION = 0.5;
 const BUY_WAIT_MS = 1000;
 const IDLE_WAIT_MS = 30000;
 const STARTING_SHAPE = { level: 1, ram: 1, cores: 1 };
+const FORMULAS_PROGRAM = "Formulas.exe";
 
 /**
  * @typedef {{ level: number, ram: number, cores: number }} NodeShape
@@ -19,6 +20,11 @@ export async function main(ns) {
         reportFailure(ns, "hacknet.js handles Hacknet Nodes only; this save has Hacknet Servers, which produce hashes");
 
         return;
+    }
+
+    while (!ns.fileExists(FORMULAS_PROGRAM, "home")) {
+        reportFailure(ns, `hacknet.js needs ${FORMULAS_PROGRAM} (buy it from the dark web); checking again in ${ns.format.time(IDLE_WAIT_MS)}`);
+        await ns.sleep(IDLE_WAIT_MS);
     }
 
     while (true) {

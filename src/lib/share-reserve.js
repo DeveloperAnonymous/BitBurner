@@ -1,14 +1,17 @@
 export const SHARE_SCRIPT = "/share.js";
-export const SHARE_RAM_FRACTION = 0.5;
+export const CLOUD_SHARE_FRACTION = 0.5;
+export const WORLD_SHARE_FRACTION = 0.5;
 const CLOUD_PREFIX = "cloud-";
 
 /**
- * RAM set aside for share.js on a host. Only cloud servers carry a reserve.
+ * RAM set aside for share.js on a host. Home carries no reserve.
  * @param {string} host
  * @param {number} maxRam
  */
 export function shareReserve(host, maxRam) {
-    return host.startsWith(CLOUD_PREFIX) ? maxRam * SHARE_RAM_FRACTION : 0;
+    if (host === "home") return 0;
+
+    return maxRam * (host.startsWith(CLOUD_PREFIX) ? CLOUD_SHARE_FRACTION : WORLD_SHARE_FRACTION);
 }
 
 /**

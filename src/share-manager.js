@@ -1,5 +1,5 @@
 import { reportFailure } from "/lib/report.js";
-import { SHARE_RAM_FRACTION, SHARE_SCRIPT, shareReserve, shareThreads } from "/lib/share-reserve.js";
+import { CLOUD_SHARE_FRACTION, SHARE_SCRIPT, WORLD_SHARE_FRACTION, shareReserve, shareThreads } from "/lib/share-reserve.js";
 
 const LOOP_MS = 10000;
 
@@ -14,14 +14,38 @@ export async function main(ns) {
         return;
     }
 
-    ns.print(`Keeping ${SHARE_RAM_FRACTION * 100}% of each cloud server's RAM sharing`);
+    ns.print(`Keeping ${CLOUD_SHARE_FRACTION * 100}% of cloud server RAM and ${WORLD_SHARE_FRACTION * 100}% of other rooted server RAM sharing`);
 
     while (true) {
-        const added = ns.cloud.getServerNames().reduce((total, host) => total + topUpShare(ns, host, threadRam), 0);
+        const added = shareHosts(ns).reduce((total, host) => total + topUpShare(ns, host, threadRam), 0);
         if (added > 0) ns.print(`Started ${added} share threads; share power ${ns.getSharePower().toFixed(3)}`);
 
         await ns.sleep(LOOP_MS);
     }
+}
+
+/**
+ * Every rooted server with RAM except home and hacknet servers.
+ * @param {NS} ns
+ * @returns {string[]}
+ */
+function shareHosts(ns) {
+    const visited = new Set(["home"]);
+    const queue = ["home"];
+    while (queue.length > 0) {
+        const unvisited = ns.scan(/** @type {string} */ (queue.shift())).filter(neighbor => !visited.has(neighbor));
+        for (const neighbor of unvisited) {
+            visited.add(neighbor);
+            queue.push(neighbor);
+        }
+    }
+
+    return [...visited].filter(host =>
+        host !== "home" &&
+        !host.startsWith("hacknet-") &&
+        ns.hasRootAccess(host) &&
+        ns.getServerMaxRam(host) > 0
+    );
 }
 
 /**
