@@ -1,4 +1,4 @@
-import { CRACKER_FILE, CRAWLER_FILE as CRAWLER, CRAWLER_FILES as FILES, CRAWLER_VERSION, LEGACY_WORM_FILE, PHISH_FILE as PHISH, REPORT_PORT, STASIS_FILE, STASIS_PORT, VERSION_PORT } from "/dnet/shared.js";
+import { ALL_SOLVER_FILES, CRAWLER_FILE as CRAWLER, CRAWLER_FILES as FILES, CRAWLER_VERSION, LEGACY_FILES, PHISH_FILE as PHISH, REPORT_PORT, STASIS_FILE, STASIS_PORT, VERSION_PORT } from "/dnet/shared.js";
 import { reportFailure } from "/lib/report.js";
 
 const ENTRY = "darkweb";
@@ -84,7 +84,7 @@ function cleanupDarknet(ns) {
     const present = [...new Set([ENTRY, ...listed])].filter(host => ns.serverExists(host));
 
     for (const host of present) {
-        for (const script of [CRAWLER, CRACKER_FILE, PHISH, LEGACY_WORM_FILE]) ns.scriptKill(script, host);
+        for (const script of [CRAWLER, PHISH, ...LEGACY_FILES, ...ALL_SOLVER_FILES]) ns.scriptKill(script, host);
     }
 
     ns.write(HOSTS_FILE, present.map(host => `${host}\n`).join(""), "w");
