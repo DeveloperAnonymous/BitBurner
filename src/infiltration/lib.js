@@ -28,7 +28,7 @@ export function watchStopKey(ns) {
     const win = globalThis["window"];
     const stopRequest = { pressed: false };
     const onKeyDown = (/** @type {KeyboardEvent} */ event) => {
-        if (event.key !== STOP_KEY || event.ctrlKey || event.altKey || event.metaKey) return;
+        if (event.key !== STOP_KEY || event.ctrlKey || event.altKey || event.metaKey || isTyping(event.target)) return;
 
         event.stopImmediatePropagation();
         event.preventDefault();
@@ -38,6 +38,16 @@ export function watchStopKey(ns) {
     ns.atExit(() => win.removeEventListener("keydown", onKeyDown, true));
 
     return stopRequest;
+}
+
+/**
+ * A "p" typed into the terminal or any other text field is text, not the stop key.
+ * @param {EventTarget | null} target
+ */
+function isTyping(target) {
+    const element = /** @type {HTMLElement | null} */ (target);
+
+    return Boolean(element) && (["INPUT", "TEXTAREA"].includes(element.tagName) || element.isContentEditable);
 }
 
 /**

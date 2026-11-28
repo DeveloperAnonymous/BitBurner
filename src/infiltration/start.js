@@ -7,6 +7,7 @@ const DEFAULT_MIN_DEMAND_PERCENT = 90;
 const DEMAND_ROUNDING_PERCENT = 0.05;
 const DEMAND_CHECK_MS = 2000;
 const NOTHING_TO_DO_MS = 30000;
+const FAILURE_RETRY_MS = 5000;
 const USAGE = `run /infiltration/start.js [money | rep | manual] ["Faction Name"] [--runs ${DEFAULT_RUNS}] [--demand ${DEFAULT_MIN_DEMAND_PERCENT}]`;
 
 /**
@@ -65,7 +66,7 @@ export async function main(ns) {
 
         ns.print(`Best: ${best.location} (${best.levels} levels, difficulty ${best.difficulty.toFixed(2)})`);
         const report = await runLocation(ns, doc, { location: best.location, runs, pauseMs: 0, reward }, stopRequest);
-        if (report.ended === "failed") break;
+        if (report.ended === "failed") await ns.sleep(FAILURE_RETRY_MS);
     }
 
     ns.tprint("infiltration: stopped");
