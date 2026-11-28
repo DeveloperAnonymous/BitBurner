@@ -10,6 +10,7 @@ const GROW_SAFETY = 1.1;
 const SPACER_MS = 100;
 const BATCH_STRIDE_MS = 4 * SPACER_MS;
 const MAX_BATCHES_PER_WAVE = 1000;
+const MAX_TARGETS = 3;
 const LOOP_MS = 1000;
 const IDLE_WAIT_MS = 30000;
 const STATUS_EVERY_LOOPS = 30;
@@ -67,7 +68,7 @@ export async function main(ns) {
         releaseFinishedTargets(ns, busyTargets);
 
         let pool = freeRamByHost(ns, hosts, shareThreadRam);
-        const freeTargets = rankedTargets(ns, servers).filter(target => !busyTargets.has(target));
+        const freeTargets = rankedTargets(ns, servers).slice(0, MAX_TARGETS).filter(target => !busyTargets.has(target));
         for (const target of freeTargets) {
             const allotment = { pool, ramShare: totalFreeRam(pool) };
             const launch = isPrepped(ns, target) ? launchWave(ns, target, allotment, scriptRam) : launchPrep(ns, target, allotment, scriptRam);
