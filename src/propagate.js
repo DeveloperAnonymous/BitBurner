@@ -68,8 +68,8 @@ export async function main(ns) {
 
         let pool = freeRamByHost(ns, hosts, shareThreadRam);
         const freeTargets = rankedTargets(ns, servers).filter(target => !busyTargets.has(target));
-        for (const [index, target] of freeTargets.entries()) {
-            const allotment = { pool, ramShare: totalFreeRam(pool) / (freeTargets.length - index) };
+        for (const target of freeTargets) {
+            const allotment = { pool, ramShare: totalFreeRam(pool) };
             const launch = isPrepped(ns, target) ? launchWave(ns, target, allotment, scriptRam) : launchPrep(ns, target, allotment, scriptRam);
             if (launch === null) continue;
 

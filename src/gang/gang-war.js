@@ -1,17 +1,37 @@
-/** @param {NS} ns  One-shot helper. args: [clashChance, memberCount] */
+const ENGAGED_MARGIN = 0.1;
+
+/**
+ * One-shot helper started by gang.js. Turns territory clashes on when the worst odds against any rival reach
+ * the threshold, and keeps them on until the odds fall ENGAGED_MARGIN below it.
+ * args: [clashChance, rosterFull (1/0), runId]
+ * @param {NS} ns
+ */
 export async function main(ns) {
-  const chance = Number(ns.args[0] ?? 0.6);
-  const members = Number(ns.args[1] ?? 0);
-  const info = ns.gang.getGangInformation();
-  let want = false;
-  if (members >= 12 && info.territory < 1) {
-    const all = ns.gang.getAllGangInformation();   // v3 name; includes your own gang
-    const rivals = Object.keys(all).filter(g => g !== info.faction && all[g].territory > 0);
-    if (rivals.length) {
-      const min = Math.min(...rivals.map(g => ns.gang.getChanceToWinClash(g)));
-      // hysteresis: stay engaged until odds drop 0.1 below the turn-on threshold
-      want = min >= (info.territoryWarfareEngaged ? chance - 0.1 : chance);
-    }
-  }
-  if (info.territoryWarfareEngaged !== want) ns.gang.setTerritoryWarfare(want);
+    ns.disableLog("ALL");
+    const clashChance = Number(ns.args[0]);
+    const rosterFull = Boolean(ns.args[1]);
+
+    const info = ns.gang.getGangInformation();
+    const engage = rosterFull && info.territory < 1 && worstClashChance(ns, info.faction) >= threshold(clashChance, info);
+    if (info.territoryWarfareEngaged !== engage) ns.gang.setTerritoryWarfare(engage);
+}
+
+/**
+ * @param {NS} ns
+ * @param {string} ownFaction
+ */
+function worstClashChance(ns, ownFaction) {
+    const gangs = ns.gang.getAllGangInformation();
+    const rivals = Object.keys(gangs).filter(gang => gang !== ownFaction && gangs[gang].territory > 0);
+    if (rivals.length === 0) return 0;
+
+    return Math.min(...rivals.map(gang => ns.gang.getChanceToWinClash(gang)));
+}
+
+/**
+ * @param {number} clashChance
+ * @param {GangGenInfo} info
+ */
+function threshold(clashChance, info) {
+    return info.territoryWarfareEngaged ? clashChance - ENGAGED_MARGIN : clashChance;
 }

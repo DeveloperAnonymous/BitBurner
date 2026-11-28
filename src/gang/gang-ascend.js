@@ -1,11 +1,19 @@
-/** @param {NS} ns  One-shot helper. args: [minGain, isHacking(1/0)] */
+import { reportFailure } from "/lib/report.js";
+import { ascensionGain } from "/gang/ascension.js";
+
+/**
+ * One-shot helper started by gang.js. Ascends every member whose gain reaches the threshold.
+ * args: [minGain, isHacking (1/0), runId]
+ * @param {NS} ns
+ */
 export async function main(ns) {
-  const minGain = Number(ns.args[0] ?? 1.5);
-  const keys = ns.args[1] ? ["hack", "cha"] : ["str", "def", "dex", "agi"];
-  for (const n of ns.gang.getMemberNames()) {
-    const r = ns.gang.getAscensionResult(n);
-    if (!r) continue;
-    const gain = Math.pow(keys.reduce((p, k) => p * r[k], 1), 1 / keys.length);
-    if (gain >= minGain) ns.gang.ascendMember(n);
-  }
+    ns.disableLog("ALL");
+    const minGain = Number(ns.args[0]);
+    const isHacking = Boolean(ns.args[1]);
+
+    for (const name of ns.gang.getMemberNames()) {
+        const result = ns.gang.getAscensionResult(name);
+        if (!result || ascensionGain(result, isHacking) < minGain) continue;
+        if (!ns.gang.ascendMember(name)) reportFailure(ns, `ascendMember ${name} returned nothing`);
+    }
 }

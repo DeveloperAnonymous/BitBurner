@@ -1,114 +1,216 @@
-/** @param {NS} ns
- *  Main gang loop. Kept small on purpose: the expensive API calls (ascend,
- *  equipment, territory clash odds) live in the one-shot helper scripts
- *  gang-ascend.js, gang-equip.js and gang-war.js, which this script launches
- *  every so often. Keep all four files on "home".
+import { reportFailure } from "/lib/report.js";
+
+const CONFIG = {
+    ascendGain: 1.5,
+    minMembersToAscend: 3,
+    wantedPenaltyLow: 0.95,
+    wantedPenaltyHigh: 0.99,
+    cleanWantedLevel: 1.01,
+    equipBudget: 0.5,
+    clashChance: 0.6,
+    warfareFraction: 0.34,
+    maxMembers: 12,
+    notInGangSleepMs: 5000,
+};
+
+const HELPERS = {
+    equip: { script: "/gang/gang-equip.js", every: 5, offset: 2 },
+    ascend: { script: "/gang/gang-ascend.js", every: 15, offset: 7 },
+    war: { script: "/gang/gang-war.js", every: 20, offset: 12 },
+};
+
+const VIGILANTE = "Vigilante Justice";
+const WARFARE = "Territory Warfare";
+const NON_EARNING_TASKS = new Set(["Unassigned", VIGILANTE, WARFARE]);
+const DIFFICULTY_PENALTY = 4;
+
+/**
+ * @typedef {{ name: string, info: GangMemberInfo, bestTask: string | null, score: number }} Row
+ */
+
+/**
+ * Main gang loop, one pass per gang update. The costly calls (ascend, equipment, clash odds) live in one-shot
+ * helpers under /gang/ so this script stays small. Keep every file on home.
+ * run /gang/gang.js
+ * @param {NS} ns
  */
 export async function main(ns) {
-  ns.disableLog("ALL");
+    ns.disableLog("ALL");
+    let tasks = null;
+    let vigilantes = 0;
+    let tick = 0;
 
-  const CFG = {
-    ascendGain: 1.5,        // ascend when avg multiplier gain >= this
-    minMembersToAscend: 3,
-    wantedLow: 0.95,        // wanted penalty multiplier below this -> add a vigilante
-    wantedHigh: 0.99,       // above this -> release a vigilante
-    equipBudget: 0.5,       // fraction of home money gear may use per run
-    clashChance: 0.6,       // turn territory clashes on at this min win chance (off at -0.1)
-    warfareFraction: 0.34,  // fraction of members building power while clashes are off
-    maxMembers: 12,
-    // helper cadence, in loop ticks (~2s each)
-    equipEvery: 5,  equipOffset: 2,
-    ascendEvery: 15, ascendOffset: 7,
-    warEvery: 20,   warOffset: 12,
-  };
+    while (true) {
+        if (!ns.gang.inGang()) {
+            await ns.sleep(CONFIG.notInGangSleepMs);
+            continue;
+        }
 
-  const SKIP = new Set(["Unassigned", "Vigilante Justice", "Territory Warfare"]);
-  let vigCount = 0;
-  let tasks = null;
-  let tick = 0;
+        await ns.gang.nextUpdate();
+        tick++;
 
-  // launch a helper on this server; silently skips if there isn't enough free RAM yet
-  const launch = (every, offset, script, ...args) => {
-    if (tick % every === offset) ns.run(script, 1, ...args, tick);
-  };
+        const gang = ns.gang.getGangInformation();
+        tasks ??= loadEarningTasks(ns, gang.isHacking);
+        const names = recruitAll(ns);
+        const rosterFull = names.length >= CONFIG.maxMembers;
+        launchHelpers(ns, tick, gang.isHacking, names.length);
+        vigilantes = nextVigilanteCount(vigilantes, gang);
+        const warriors = rosterFull && gang.territory < 1 && !gang.territoryWarfareEngaged ? Math.floor(names.length * CONFIG.warfareFraction) : 0;
+        vigilantes = assignTasks(ns, { names, tasks, rosterFull, vigilantes, warriors, isHacking: gang.isHacking });
 
-  while (true) {
-    tick++;
-
-    let info;
-    try { info = ns.gang.getGangInformation(); }   // throws if not in a gang yet
-    catch { await ns.sleep(5000); continue; }
-    const hacking = info.isHacking;
-    const h = hacking ? 1 : 0;
-
-    // task table (cached)
-    if (!tasks) {
-      tasks = ns.gang.getTaskNames()
-        .map(n => ns.gang.getTaskStats(n))
-        .filter(t => !SKIP.has(t.name) && !t.name.startsWith("Train")
-          && t.baseWanted >= 0 && (hacking ? t.isHacking : t.isCombat));
+        ns.print(`${names.length}/${CONFIG.maxMembers} | penalty ${gang.wantedPenalty.toFixed(3)} | vigilantes ${vigilantes} | warfare ${warriors} | ${rosterFull ? "money" : "respect"} mode`);
     }
-    const weight = (t, m) =>
-      (t.hackWeight * m.hack + t.strWeight * m.str + t.defWeight * m.def +
-       t.dexWeight * m.dex + t.agiWeight * m.agi + t.chaWeight * m.cha) / 100
-      - 4 * t.difficulty;
+}
 
-    // 1. recruit
+/**
+ * @param {NS} ns
+ * @param {boolean} isHacking
+ * @returns {GangTaskStats[]}
+ */
+function loadEarningTasks(ns, isHacking) {
+    return ns.gang.getTaskNames()
+        .map(name => ns.gang.getTaskStats(name))
+        .filter(task => !NON_EARNING_TASKS.has(task.name) && !task.name.startsWith("Train") && task.baseWanted >= 0 && (isHacking ? task.isHacking : task.isCombat));
+}
+
+/**
+ * @param {NS} ns
+ * @returns {string[]}
+ */
+function recruitAll(ns) {
     const names = ns.gang.getMemberNames();
-    while (names.length < CFG.maxMembers) {
-      let i = names.length + 1;
-      while (names.includes(`g-${i}`)) i++;
-      if (!ns.gang.recruitMember(`g-${i}`)) break;
-      names.push(`g-${i}`);
+
+    while (names.length < CONFIG.maxMembers) {
+        const name = freeMemberName(names);
+        if (!ns.gang.recruitMember(name)) break;
+
+        names.push(name);
     }
 
-    // 2. helpers (each is a short one-shot script)
-    launch(CFG.equipEvery, CFG.equipOffset, "gang-equip.js", h, CFG.equipBudget);
-    if (names.length >= CFG.minMembersToAscend)
-      launch(CFG.ascendEvery, CFG.ascendOffset, "gang-ascend.js", CFG.ascendGain, h);
-    launch(CFG.warEvery, CFG.warOffset, "gang-war.js", CFG.clashChance, names.length);
+    return names;
+}
 
-    // 3. wanted-level controller (hysteresis, one step per cycle)
-    if (info.wantedLevel <= 1.01) vigCount = 0;
-    else if (info.wantedPenalty < CFG.wantedLow) vigCount++;
-    else if (info.wantedPenalty > CFG.wantedHigh && vigCount > 0) vigCount--;
+/** @param {string[]} names */
+function freeMemberName(names) {
+    let index = names.length + 1;
+    while (names.includes(`g-${index}`)) index++;
 
-    // 4. territory power building: only while clashes are off and land remains
-    const full = names.length >= CFG.maxMembers;
-    const warfareCount = (full && info.territory < 1 && !info.territoryWarfareEngaged)
-      ? Math.floor(names.length * CFG.warfareFraction) : 0;
+    return `g-${index}`;
+}
 
-    // 5. assign tasks: respect until the roster is full, then money
-    const rows = names.map(n => {
-      const m = ns.gang.getMemberInformation(n);
-      let best = null, bestScore = 0;
-      for (const t of tasks) {
-        const w = weight(t, m);
-        if (w <= 0) continue;
-        const s = (full ? t.baseMoney : t.baseRespect) * w;
-        if (s > bestScore) { bestScore = s; best = t.name; }
-      }
-      return { n, m, best, score: bestScore };
-    });
+/**
+ * @param {NS} ns
+ * @param {number} tick
+ * @param {boolean} isHacking
+ * @param {number} memberCount
+ */
+function launchHelpers(ns, tick, isHacking, memberCount) {
+    const hackingFlag = isHacking ? 1 : 0;
+    const rosterFlag = memberCount >= CONFIG.maxMembers ? 1 : 0;
 
-    const trainTask = hacking ? "Train Hacking" : "Train Combat";
-    const workers = rows.filter(r => r.best).sort((a, b) => a.score - b.score);
-    vigCount = Math.min(vigCount, workers.length);
-    const vigSet = new Set(workers.slice(0, vigCount).map(r => r.n));
-    const warSet = new Set(workers.slice(vigCount).reverse().slice(0, warfareCount).map(r => r.n));
+    launchOnTick(ns, tick, HELPERS.equip, [hackingFlag, CONFIG.equipBudget, CONFIG.ascendGain]);
+    if (memberCount >= CONFIG.minMembersToAscend) launchOnTick(ns, tick, HELPERS.ascend, [CONFIG.ascendGain, hackingFlag]);
+    launchOnTick(ns, tick, HELPERS.war, [CONFIG.clashChance, rosterFlag]);
+}
 
-    for (const r of rows) {
-      let task;
-      if (!r.best) task = trainTask;
-      else if (vigSet.has(r.n)) task = "Vigilante Justice";
-      else if (warSet.has(r.n)) task = "Territory Warfare";
-      else task = r.best;
-      if (r.m.task !== task) ns.gang.setMemberTask(r.n, task);
+/**
+ * @param {NS} ns
+ * @param {number} tick
+ * @param {{ script: string, every: number, offset: number }} helper
+ * @param {(string | number)[]} args
+ */
+function launchOnTick(ns, tick, helper, args) {
+    if (tick % helper.every !== helper.offset) return;
+
+    // The tick is passed as a last arg so a still-running copy never blocks the launch as a duplicate.
+    if (ns.run(helper.script, 1, ...args, tick) !== 0) return;
+
+    const needed = ns.getScriptRam(helper.script, "home");
+    const free = ns.getServerMaxRam("home") - ns.getServerUsedRam("home");
+    reportFailure(ns, `could not start ${helper.script}: needs ${needed.toFixed(2)} GB, home has ${free.toFixed(2)} GB free`);
+}
+
+/**
+ * Adds one vigilante while the wanted penalty is too high and removes one once it recovers.
+ * @param {number} current
+ * @param {GangGenInfo} gang
+ */
+function nextVigilanteCount(current, gang) {
+    if (gang.wantedLevel <= CONFIG.cleanWantedLevel) return 0;
+    if (gang.wantedPenalty < CONFIG.wantedPenaltyLow) return current + 1;
+    if (gang.wantedPenalty > CONFIG.wantedPenaltyHigh && current > 0) return current - 1;
+
+    return current;
+}
+
+/**
+ * Weakest earners go vigilante, strongest build territory power, the rest take their best task.
+ * @param {NS} ns
+ * @param {{ names: string[], tasks: GangTaskStats[], rosterFull: boolean, vigilantes: number, warriors: number, isHacking: boolean }} plan
+ * @returns {number} vigilantes actually assigned
+ */
+function assignTasks(ns, plan) {
+    const rows = plan.names.map(name => scoreMember(ns, name, plan.tasks, plan.rosterFull));
+    const earners = rows.filter(row => row.bestTask).sort((a, b) => a.score - b.score);
+    const vigilantes = Math.min(plan.vigilantes, earners.length);
+    const vigilanteNames = new Set(earners.slice(0, vigilantes).map(row => row.name));
+    const warriorNames = new Set(earners.slice(vigilantes).reverse().slice(0, plan.warriors).map(row => row.name));
+    const trainTask = plan.isHacking ? "Train Hacking" : "Train Combat";
+
+    for (const row of rows) {
+        const task = pickTask(row, vigilanteNames, warriorNames, trainTask);
+        if (row.info.task !== task) ns.gang.setMemberTask(row.name, task);
     }
 
-    ns.print(`${names.length}/${CFG.maxMembers} | penalty ${info.wantedPenalty.toFixed(3)} | ` +
-             `vig ${vigCount} | war ${warfareCount} | ${full ? "money" : "respect"} mode`);
+    return vigilantes;
+}
 
-    await ns.sleep(2000);
-  }
+/**
+ * @param {Row} row
+ * @param {Set<string>} vigilanteNames
+ * @param {Set<string>} warriorNames
+ * @param {string} trainTask
+ */
+function pickTask(row, vigilanteNames, warriorNames, trainTask) {
+    if (!row.bestTask) return trainTask;
+    if (vigilanteNames.has(row.name)) return VIGILANTE;
+    if (warriorNames.has(row.name)) return WARFARE;
+
+    return row.bestTask;
+}
+
+/**
+ * Best task by money once the roster is full, by respect before that.
+ * @param {NS} ns
+ * @param {string} name
+ * @param {GangTaskStats[]} tasks
+ * @param {boolean} rosterFull
+ * @returns {Row}
+ */
+function scoreMember(ns, name, tasks, rosterFull) {
+    const info = ns.gang.getMemberInformation(name);
+    let bestTask = null;
+    let score = 0;
+
+    for (const task of tasks) {
+        const fit = taskFit(task, info);
+        const value = fit > 0 ? (rosterFull ? task.baseMoney : task.baseRespect) * fit : 0;
+        if (value <= score) continue;
+
+        score = value;
+        bestTask = task.name;
+    }
+
+    return { name, info, bestTask, score };
+}
+
+/**
+ * @param {GangTaskStats} task
+ * @param {GangMemberInfo} member
+ */
+function taskFit(task, member) {
+    const weighted = task.hackWeight * member.hack + task.strWeight * member.str + task.defWeight * member.def
+        + task.dexWeight * member.dex + task.agiWeight * member.agi + task.chaWeight * member.cha;
+
+    return weighted / 100 - DIFFICULTY_PENALTY * task.difficulty;
 }
